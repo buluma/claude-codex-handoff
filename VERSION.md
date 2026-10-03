@@ -22,7 +22,7 @@ Toolchain consolidation and bugfixes. The wire format is unchanged, so old runti
 - `poll-gate.py`: an invalid `--session` now fails with exit `2` instead of silently substituting `<side>-default` and gating on a different session's cursor. Reports `cursor_source`, `cursor_file`, and `unknown_type` in its JSON summary.
 - `doctor.py`: a missing legacy `.<side>-cursor` is informational, since the anchor is optional; unparseable stream lines are called out explicitly.
 - Durable writes now fsync the parent directory after `os.replace`, so a completed rename survives power loss (§0 rule 9).
-- Add `tools/tests/` and CI on Linux, macOS, and Windows.
+- Add `tools/tests/` and CI on Linux and macOS.
 
 ---
 

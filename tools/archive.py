@@ -6,7 +6,7 @@ reading-side session has already consumed into `.handoff-runtime/archive/`, then
 atomically rewrites the live stream with only the still-unconsumed tail. It never
 drops a line any reader hasn't passed, and never drops the latest line.
 
-Stdlib only, so it runs from PowerShell, bash, Claude, or Codex without setup.
+Stdlib only, so it runs from macOS, Linux, Claude, or Codex without setup.
 
 Usage:
     python .handoff/tools/archive.py            # archive both streams

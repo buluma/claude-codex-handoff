@@ -2,7 +2,7 @@
 """Write one handoff JSONL message with protocol-safe defaults.
 
 This helper intentionally uses only the Python standard library so it can be
-called from PowerShell, Git Bash, Claude, or Codex without extra setup.
+called from macOS, Linux, Claude, or Codex without extra setup.
 """
 
 from __future__ import annotations

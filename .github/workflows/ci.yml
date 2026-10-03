@@ -7,26 +7,24 @@ on:
 
 jobs:
   tools:
-    # The kit ships platform-specific setup scripts and a cross-platform
-    # stdlib-only toolchain, so test on all three.
+    # The stdlib-only toolchain is tested on both supported platforms.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
-          # Oldest and newest supported interpreters.
-          python-version: ${{ matrix.os == 'windows-latest' && '3.9' || '3.12' }}
+          python-version: '3.12'
       - name: Run tool tests
         run: python -m unittest discover -s tools/tests -t tools/tests -v
 
   setup-scripts:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Shellcheck setup.sh
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
@@ -70,38 +68,3 @@ jobs:
           fi
           git check-ignore -q .handoff-runtime/claude-to-codex.jsonl \
             || { echo "streams are not ignored"; exit 1; }
-
-  setup-ps1:
-    # setup.ps1 cannot be exercised on unix, and a mirror of setup.sh that is
-    # never executed is how the two drift apart.
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run setup.ps1 in a throwaway project
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $work = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "proj")
-          New-Item -ItemType Directory -Path (Join-Path $work ".handoff") | Out-Null
-          Copy-Item setup.ps1 (Join-Path $work ".handoff")
-          Push-Location $work
-          try {
-            & .\.handoff\setup.ps1
-            foreach ($d in @("notes", "claims", "locks", "cursors", "archive")) {
-              if (-not (Test-Path (Join-Path ".handoff-runtime" $d) -PathType Container)) {
-                throw "missing $d"
-              }
-            }
-            $ignore = Join-Path ".handoff-runtime" ".gitignore"
-            if (-not (Test-Path $ignore)) { throw "setup.ps1 did not create .gitignore" }
-            if ((Get-Content -Raw $ignore).Trim() -ne "*") {
-              throw "runtime .gitignore is not a self-ignore: $((Get-Content -Raw $ignore))"
-            }
-            git init -q .
-            $status = git status --porcelain
-            if ($status -match "handoff-runtime") {
-              throw "runtime state is still committable: $status"
-            }
-          } finally {
-            Pop-Location
-          }

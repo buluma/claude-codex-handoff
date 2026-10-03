@@ -12,13 +12,11 @@ From your project root, clone this repo as `.handoff/`, then run setup:
 cd your-project
 git clone https://github.com/OpenMOSS/claude-codex-handoff.git .handoff
 
-# macOS / Linux / WSL:
+# macOS / Linux:
 bash .handoff/setup.sh
-# Windows:
-powershell -ExecutionPolicy Bypass -File .handoff\setup.ps1
 ```
 
-Don't want to type the shell command yourself? Open the project in **Claude Code** or **Codex** and ask the agent to **run `.handoff/setup.sh`** (Windows: **`.handoff\setup.ps1`**) — it can see the script in your tree and will run it for you. Setup is what copies `CLAUDE.md` / `AGENTS.md` into your project root; _after_ that the agents have an entry file, so saying **"start collaboration"** (or **`costart`**) kicks off the actual collaboration — see [Quick start](#quick-start-start-a-collaboration) below. (Before setup runs, a bare "start collaboration" won't work: with no root entry file yet, the agent has no way to know `.handoff/` exists.)
+Don't want to type the shell command yourself? Open the project in **Claude Code** or **Codex** and ask the agent to **run `.handoff/setup.sh`** — it can see the script in your tree and will run it for you. Setup is what copies `CLAUDE.md` / `AGENTS.md` into your project root; _after_ that the agents have an entry file, so saying **"start collaboration"** (or **`costart`**) kicks off the actual collaboration — see [Quick start](#quick-start-start-a-collaboration) below. (Before setup runs, a bare "start collaboration" won't work: with no root entry file yet, the agent has no way to know `.handoff/` exists.)
 
 `setup` creates `.handoff-runtime/` (live state) and copies `PROJECT.md` / `CLAUDE.md` / `AGENTS.md` to your project root if they're absent. From then on Claude Code (via `CLAUDE.md`) and Codex (via `AGENTS.md`) both read the same `.handoff/`. Update later with `git -C .handoff pull`.
 
@@ -30,7 +28,7 @@ Don't want to type the shell command yourself? Open the project in **Claude Code
 your-project/
 ├── .handoff/                       # this repo — protocol + helper + templates (shared, one copy)
 │   ├── PROTOCOL.md                 # the spec — source of truth
-│   ├── setup.ps1 / setup.sh
+│   ├── setup.sh
 │   ├── tools/send.py               # protocol-safe JSONL sender (stdlib only)
 │   ├── tools/archive.py            # consumed-stream archive helper
 │   ├── tools/doctor.py             # read-only runtime diagnostics
@@ -110,7 +108,7 @@ The tools are stdlib-only Python and share `tools/_common.py`, so protocol invar
 python -m unittest discover -s tools/tests -t tools/tests -v
 ```
 
-CI runs the suite on Linux, macOS, and Windows.
+CI runs the suite on Linux and macOS.
 
 ## License
 

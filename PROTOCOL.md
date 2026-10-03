@@ -32,7 +32,6 @@ When implementing or executing this protocol, follow these short rules first. Th
 .handoff/
 ├── PROTOCOL.md
 ├── README.md
-├── setup.ps1
 ├── setup.sh
 ├── tools/
 │   ├── send.py
@@ -87,7 +86,7 @@ Hard rules:
 - Each message is one JSON line: `json.dumps(msg) + "\n"`.
 - The content of a written JSONL line is never modified or reordered. The only exception is archival in §13: under the send lock, move the prefix that **every reader has already consumed** into `archive/` as a whole, then atomically replace the stream with a rewrite that contains only the unconsumed lines. This does not change any individual line, and it does not affect seq monotonicity.
 - Encoding is UTF-8 without BOM. Newlines are LF.
-- Paths use POSIX forward slashes. Do not write Windows backslashes in message fields.
+- Paths use POSIX forward slashes.
 - Write long content to `.handoff-runtime/notes/<message-id>.md`. fsync the note first, then append the JSONL message that references it.
 - Persist every small runtime file (cursor, seq, claim, lastseen) with "write a temp file + fsync + atomic rename". Do not half-write in place. The helper's `atomic_write_text` already does this. A reader advancing a cursor must do the same.
 - Prefer `.handoff/tools/send.py` when sending. Hand-written JSONL is only a fallback when the helper is unavailable or you are fixing the helper.
@@ -198,7 +197,7 @@ Terminal-closure rules:
 
 Prefer the helper:
 
-```powershell
+```bash
 python .handoff/tools/send.py --side codex --type status --summary "claimed first-pass review" --state claimed --eta PT30M
 python .handoff/tools/send.py --side claude --type task --summary "check terminology consistency" --goal "locate inconsistent terms and report a list"
 python .handoff/tools/send.py --side codex --type done --reply-to claude-000001 --summary "terminology scan complete"
@@ -358,7 +357,7 @@ Codex side:
 - Use the Codex App heartbeat on the current thread. By default it runs `.handoff/prompts/codex-heartbeat-prompt.md` every 10 minutes. Adaptive cadence uses minute intervals the heartbeat can express: +10 minutes after a loop with no peer reply, and directly back to 10 minutes after a loop with a peer reply.
 - An empty queue may do one read-only, bounded proactive review. Rules are in §6.4.
 - If the heartbeat is unavailable, the fallback is to scan the JSONL manually on each user turn.
-- Do not create a Windows Task Scheduler job, `Start-Job`, `Start-Process`, `pythonw`, a file watcher, or any other unverifiable long-running background process, unless the user explicitly asks to replace the Codex App heartbeat.
+- Do not create any unverifiable long-running background process, unless the user explicitly asks to replace the Codex App heartbeat.
 
 Rules for both sides:
 
@@ -372,11 +371,11 @@ Rules for both sides:
 
 ## 9. Reset / fresh initialization
 
-`setup.ps1` / `setup.sh` creates `.handoff-runtime/`, the streams, legacy cursor files, seq files, notes, claims, the `cursors/` directory, `archive/`, and the self-ignoring `.handoff-runtime/.gitignore`.
+`setup.sh` creates `.handoff-runtime/`, the streams, legacy cursor files, seq files, notes, claims, the `cursors/` directory, `archive/`, and the self-ignoring `.handoff-runtime/.gitignore`.
 
 Default reset semantics:
 
-- When the user allows history to be cleared, run `.handoff/setup.ps1 -Fresh` or the equivalent script. It deletes and recreates `.handoff-runtime/` directly.
+- When the user allows history to be cleared, run `bash .handoff/setup.sh --fresh` or the equivalent setup command. It deletes and recreates `.handoff-runtime/` directly.
 - `-Fresh` does not keep old messages, notes, claims, per-session cursors, or the legacy cursor.
 - Reset does not touch `.handoff/`, `PROJECT.md`, `AGENTS.md`, `CLAUDE.md`, body text, or source code.
 

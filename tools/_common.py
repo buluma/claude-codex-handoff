@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Shared primitives for the claude-codex-handoff tools.
 
-Stdlib only, by design: these helpers must run from PowerShell, Git Bash,
-Claude, or Codex with no install step. Every tool imports this module so that
+Stdlib only, by design: these helpers run from macOS or Linux with no install
+step. Every tool imports this module so that
 protocol invariants -- stream names, id grammar, session-id grammar, cursor
 resolution, the send lock, and atomic+fsync writes -- have exactly one
 implementation. When two tools resolve an invariant separately they eventually
@@ -91,7 +91,6 @@ def fsync_dir(path: Path) -> None:
 
     `os.replace` is atomic with respect to readers, but without an fsync of the
     containing directory the rename itself can still be lost on power failure.
-    Windows cannot open a directory for this; skip it there.
     """
     try:
         fd = os.open(str(path), os.O_RDONLY)
@@ -122,12 +121,6 @@ def atomic_write_text(path: Path, text: str) -> None:
             os.unlink(tmp_name)
 
 
-def _open_flags(base: int) -> int:
-    if hasattr(os, "O_BINARY"):
-        return base | os.O_BINARY
-    return base
-
-
 def write_new_file(path: Path, text: str) -> None:
     """Create `path` with `text`, failing if it already exists.
 
@@ -136,7 +129,7 @@ def write_new_file(path: Path, text: str) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        fd = os.open(path, _open_flags(os.O_CREAT | os.O_EXCL | os.O_WRONLY), 0o666)
+        fd = os.open(path, (os.O_CREAT | os.O_EXCL | os.O_WRONLY), 0o666)
     except FileExistsError:
         return False
     try:
@@ -155,7 +148,7 @@ def append_jsonl(path: Path, obj: dict[str, Any]) -> None:
     payload = (
         json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
     ).encode("utf-8")
-    fd = os.open(path, _open_flags(os.O_APPEND | os.O_CREAT | os.O_WRONLY), 0o666)
+    fd = os.open(path, (os.O_APPEND | os.O_CREAT | os.O_WRONLY), 0o666)
     try:
         view = memoryview(payload)
         while view:
@@ -297,8 +290,7 @@ def runtime_dir(root: Path) -> Path:
     runtime = root / RUNTIME_DIRNAME
     if not runtime.is_dir():
         raise HandoffError(
-            f"could not find {RUNTIME_DIRNAME}/; run bash .handoff/setup.sh "
-            "(Windows: powershell -ExecutionPolicy Bypass -File .handoff\\setup.ps1)"
+            f"could not find {RUNTIME_DIRNAME}/; run bash .handoff/setup.sh"
         )
     return runtime
 
@@ -516,7 +508,7 @@ class SendLock:
         while True:
             try:
                 fd = os.open(
-                    self.path, _open_flags(os.O_CREAT | os.O_EXCL | os.O_WRONLY), 0o666
+                    self.path, (os.O_CREAT | os.O_EXCL | os.O_WRONLY), 0o666
                 )
                 try:
                     payload = {

@@ -54,9 +54,9 @@ For the step 7 adaptive-cadence rule, treat exit `0` as `had_peer_reply=true` an
 - Maintain `.handoff-runtime/codex-heartbeat-state.json` with at least `current_interval_minutes`, `last_run_had_peer_reply`, and `updated_at`; `consecutive_idle` may remain for legacy diagnostics but is not used as a threshold.
 - If `had_peer_reply=false`, increase the heartbeat interval by 10 minutes after this single loop, write the state file, and update the heartbeat automation (the Codex App automation you created for this project, e.g. `codex-handoff-monitor`) to the new minute interval.
 - If `had_peer_reply=true`, set the heartbeat interval directly to 10 minutes, write the state file, and update the heartbeat automation only if the interval changed.
-- Use `codex_app.automation_update` for schedule changes, preserving the existing heartbeat name, kind, target thread, status, and prompt. Do not create Task Scheduler jobs, `Start-Job`, `Start-Process`, `pythonw`, detached workers, or file watchers.
+- Use `codex_app.automation_update` for schedule changes, preserving the existing heartbeat name, kind, target thread, status, and prompt. Do not create detached workers or file watchers.
 - Apply cadence changes after all required handoff side effects and cursor updates. Keep cadence-only changes quiet unless a tool failure needs user attention.
 
 When a task requires editing files, keep edits narrowly scoped to the inbound request and preserve user changes. During proactive review with no inbound task, make no repository edits except `.handoff-runtime` notes/outbound messages required to report a concrete finding.
 
-Do not create Task Scheduler jobs, `Start-Job`, `Start-Process`, `pythonw`, or detached local monitor processes unless the user explicitly asks to replace the Codex App heartbeat model.
+Do not create detached local monitor processes unless the user explicitly asks to replace the Codex App heartbeat model.

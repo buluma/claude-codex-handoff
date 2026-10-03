@@ -17,7 +17,7 @@ Trigger phrases: **`costart`**, or "start collaboration". A task goal may follow
 
 When you receive a trigger phrase, run this one-time bootstrap:
 
-1. If `.handoff-runtime/` does not exist, run `.handoff/setup.ps1` (Windows) or `bash .handoff/setup.sh` first.
+1. If `.handoff-runtime/` does not exist, run `bash .handoff/setup.sh` first.
 2. If `PROJECT.md` still contains `<FILL_IN>`, confirm the project name, description, and Codex task boundary with the user, and write them back.
 3. Create a recurring cron every 10 minutes from `.handoff/prompts/cron-prompt.md` (use CronCreate; do not start a persistent Monitor).
 4. Do one polling pass: read `.handoff-runtime/codex-to-claude.jsonl` and consume unread messages under the protocol.

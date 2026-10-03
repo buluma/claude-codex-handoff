@@ -17,8 +17,8 @@ Trigger phrases: **`costart`**, or "start collaboration". A task goal may follow
 
 When you receive a trigger phrase, run this one-time bootstrap:
 
-1. If `.handoff-runtime/` does not exist, run `bash .handoff/setup.sh` first (Windows: `.handoff\setup.ps1`).
-2. In the Codex App, create or confirm a heartbeat automation on the current project thread that runs `.handoff/prompts/codex-heartbeat-prompt.md` every 10 minutes (use `codex_app.automation_update`; do not use Task Scheduler, `Start-Job`, `pythonw`, or other long-running background processes).
+1. If `.handoff-runtime/` does not exist, run `bash .handoff/setup.sh` first.
+2. In the Codex App, create or confirm a heartbeat automation on the current project thread that runs `.handoff/prompts/codex-heartbeat-prompt.md` every 10 minutes (use `codex_app.automation_update`; do not use detached long-running background processes).
 3. Do one polling pass: read `.handoff-runtime/claude-to-codex.jsonl` and consume unread messages under the protocol.
 4. If the trigger included a task goal: take it yourself when it is inside the `PROJECT.md` boundary, and reply `done` when finished. If it belongs to Claude, send it as the first `task` / `handoff` with `.handoff/tools/send.py`. If there is no goal, say you are ready and waiting for the peer.
 
@@ -42,7 +42,7 @@ This project uses Claude ↔ Codex asynchronous collaboration. The protocol is `
 
 ## Monitor practice
 
-- **Persistent automation**: the Codex side uses the Codex App heartbeat on the current thread. Do not use Windows Task Scheduler, PowerShell `Start-Job` / `Start-Process`, `pythonw`, or any other unverifiable long-running background process.
+- **Persistent automation**: the Codex side uses the Codex App heartbeat on the current thread. Do not use unverifiable long-running background processes.
 - **Consume immediately**: before actually processing tasks each round, fresh-read `.handoff-runtime/claude-to-codex.jsonl`. Decide consumption from `.handoff-runtime/cursors/codex-<MY_SESSION>` (named per §6.1), and process unconsumed messages under the protocol. If `to_session` points at another Codex session, skip it and advance this session's cursor.
 - Each round, process every inbound message that can be finished immediately, in seq order. Do not wait for the next activation just because you already handled 1 lease message.
 - If the cursor is sitting in front of a large task whose unexpired claim is already held by the current `MY_SESSION`, later heartbeats should resume that task. Do not treat your own claim as a block. Advance the cursor only after the whole inbound message is finished. Report partial output with `status state="progress"`.

@@ -64,6 +64,15 @@ foreach ($name in @(".codex-cursor", ".codex-seq", ".claude-cursor", ".claude-se
     }
 }
 
+# Runtime state is private to the two agents: streams hold the full conversation,
+# notes hold working context, claims hold leases. A `*` pattern here hides the
+# whole tree (this file included) without editing a .gitignore the project owns.
+$RuntimeIgnore = Join-Path $Runtime ".gitignore"
+if (-not (Test-Path -LiteralPath $RuntimeIgnore)) {
+    Write-Utf8NoBom $RuntimeIgnore "*`n"
+    Write-Host "Wrote $RuntimeIgnore (keeps runtime state out of version control)"
+}
+
 foreach ($name in @("PROJECT.md", "AGENTS.md", "CLAUDE.md")) {
     $src = Join-Path $ProjectFiles $name
     $dst = Join-Path $Root $name

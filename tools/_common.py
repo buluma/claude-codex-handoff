@@ -303,6 +303,63 @@ def runtime_dir(root: Path) -> Path:
     return runtime
 
 
+def runtime_gitignore_path(runtime: Path) -> Path:
+    """Self-ignoring marker written into the runtime dir by setup."""
+    return runtime / ".gitignore"
+
+
+def runtime_self_ignores(runtime: Path) -> bool:
+    """True when the runtime dir carries a `*` `.gitignore` of its own.
+
+    A `*` pattern inside `.handoff-runtime/.gitignore` hides the whole tree,
+    including the `.gitignore` itself, so setup can keep runtime state out of
+    version control without editing a `.gitignore` the project owns.
+    """
+    path = runtime_gitignore_path(runtime)
+    if not path.is_file():
+        return False
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return stripped == "*"
+    return False
+
+
+def covered_by_project_gitignore(root: Path) -> bool:
+    """Best-effort check that some ancestor `.gitignore` names the runtime dir.
+
+    This is a heuristic, not a full gitignore matcher: it only answers "does any
+    `.gitignore` at or above the project root mention `.handoff-runtime`", which
+    is enough to stop doctor from nagging about a project that already handles it
+    some other way.
+    """
+    needle = RUNTIME_DIRNAME
+    for path in [root, *root.parents]:
+        candidate = path / ".gitignore"
+        if not candidate.is_file():
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if needle in stripped:
+                return True
+    return False
+
+
+def runtime_is_git_ignored(root: Path, runtime: Path) -> bool:
+    """True when the runtime dir is covered by a self-ignore or a project rule."""
+    return runtime_self_ignores(runtime) or covered_by_project_gitignore(root)
+
+
 # --------------------------------------------------------------------------
 # Session ids (PROTOCOL.md 3.1)
 # --------------------------------------------------------------------------

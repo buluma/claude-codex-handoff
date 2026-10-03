@@ -33,18 +33,12 @@ from _common import (  # noqa: E402  (import follows the path bootstrap above)
     iter_jsonl_lines,
     parse_msg_seq,
     read_int,
+    runtime_dir,
 )
 
 
 def find_runtime(start: Path) -> Path:
-    root = find_project_root(start)
-    runtime = root / ".handoff-runtime"
-    if not runtime.is_dir():
-        raise HandoffError(
-            "could not find .handoff-runtime; run bash .handoff/setup.sh "
-            "(Windows: powershell -ExecutionPolicy Bypass -File .handoff\\setup.ps1)"
-        )
-    return runtime
+    return runtime_dir(find_project_root(start))
 
 
 def reader_archive_point(runtime: Path, reader_side: str) -> int | None:

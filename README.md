@@ -22,7 +22,7 @@ Don't want to type the shell command yourself? Open the project in **Claude Code
 
 `setup` creates `.handoff-runtime/` (live state) and copies `PROJECT.md` / `CLAUDE.md` / `AGENTS.md` to your project root if they're absent. From then on Claude Code (via `CLAUDE.md`) and Codex (via `AGENTS.md`) both read the same `.handoff/`. Update later with `git -C .handoff pull`.
 
-> **Git note.** `.handoff/` is itself a git clone. Always add **`.handoff-runtime/`** to your project's `.gitignore`. For `.handoff/` itself, either keep it as an updatable dependency (add `.handoff/` to `.gitignore`, `git -C .handoff pull` to update) or vendor it into your repo (`rm -rf .handoff/.git`, then commit the files).
+> **Git note.** `.handoff-runtime/` needs no action: setup writes a self-ignoring `.handoff-runtime/.gitignore` (containing `*`), so the streams, notes, and claims stay out of version control without touching a `.gitignore` your project owns. `doctor.py` warns if that file is ever removed. `.handoff/` is itself a git clone and *is* your choice — either keep it as an updatable dependency (add `.handoff/` to `.gitignore`, `git -C .handoff pull` to update) or vendor it into your repo (`rm -rf .handoff/.git`, then commit the files).
 
 ## Layout
 
@@ -39,7 +39,7 @@ your-project/
 │   ├── tools/tests/                # unit tests for the tools
 │   ├── project-files/              # PROJECT.md / CLAUDE.md / AGENTS.md templates
 │   └── prompts/                    # cron-prompt.md (Claude) / codex-heartbeat-prompt.md (Codex)
-├── .handoff-runtime/               # message streams, per-session cursors, claims, notes (gitignore)
+├── .handoff-runtime/               # message streams, per-session cursors, claims, notes (self-ignored)
 ├── PROJECT.md                      # shared scope + task boundaries (fill the <FILL_IN>s)
 ├── CLAUDE.md                       # Claude-side entry
 └── AGENTS.md                       # Codex-side entry

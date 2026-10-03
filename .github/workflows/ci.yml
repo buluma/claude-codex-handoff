@@ -51,3 +51,56 @@ jobs:
           for f in PROJECT.md CLAUDE.md AGENTS.md; do
             test -f "$f" || { echo "missing $f"; exit 1; }
           done
+
+      - name: Verify setup.sh keeps runtime state out of git
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d)"
+          mkdir -p "$workdir/.handoff"
+          cp setup.sh "$workdir/.handoff/"
+          cd "$workdir"
+          git init -q .
+          bash .handoff/setup.sh >/dev/null
+          test "$(cat .handoff-runtime/.gitignore)" = "*" \
+            || { echo "runtime .gitignore is not a self-ignore"; exit 1; }
+          # The whole tree, the marker included, must be invisible to git.
+          if git status --porcelain | grep -q handoff-runtime; then
+            echo "runtime state is still committable:"; git status --porcelain; exit 1
+          fi
+          git check-ignore -q .handoff-runtime/claude-to-codex.jsonl \
+            || { echo "streams are not ignored"; exit 1; }
+
+  setup-ps1:
+    # setup.ps1 cannot be exercised on unix, and a mirror of setup.sh that is
+    # never executed is how the two drift apart.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run setup.ps1 in a throwaway project
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $work = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "proj")
+          New-Item -ItemType Directory -Path (Join-Path $work ".handoff") | Out-Null
+          Copy-Item setup.ps1 (Join-Path $work ".handoff")
+          Push-Location $work
+          try {
+            & .\.handoff\setup.ps1
+            foreach ($d in @("notes", "claims", "locks", "cursors", "archive")) {
+              if (-not (Test-Path (Join-Path ".handoff-runtime" $d) -PathType Container)) {
+                throw "missing $d"
+              }
+            }
+            $ignore = Join-Path ".handoff-runtime" ".gitignore"
+            if (-not (Test-Path $ignore)) { throw "setup.ps1 did not create .gitignore" }
+            if ((Get-Content -Raw $ignore).Trim() -ne "*") {
+              throw "runtime .gitignore is not a self-ignore: $((Get-Content -Raw $ignore))"
+            }
+            git init -q .
+            $status = git status --porcelain
+            if ($status -match "handoff-runtime") {
+              throw "runtime state is still committable: $status"
+            }
+          } finally {
+            Pop-Location
+          }

@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -787,6 +788,130 @@ class TestCommandLine(FixtureTest):
         archived = list((self.fx.runtime / "archive").glob("*.jsonl"))
         self.assertEqual(len(archived), 1)
         self.assertEqual(len(archived[0].read_text(encoding="utf-8").splitlines()), 3)
+
+
+# ----------------------------------------------------------------------
+# Runtime state must not reach version control
+# ----------------------------------------------------------------------
+
+
+class TestRuntimeGitIgnore(FixtureTest):
+    """Streams, notes, and claims are private to the two agents."""
+
+    def make_git_work_tree(self) -> None:
+        (self.fx.root / ".git").mkdir(exist_ok=True)
+
+    def test_absent_gitignore_means_not_ignored(self):
+        self.assertFalse(_common.runtime_self_ignores(self.fx.runtime))
+        self.assertFalse(_common.runtime_is_git_ignored(self.fx.root, self.fx.runtime))
+
+    def test_star_pattern_counts_as_self_ignoring(self):
+        (_common.runtime_gitignore_path(self.fx.runtime)).write_text(
+            "*\n", encoding="utf-8"
+        )
+        self.assertTrue(_common.runtime_self_ignores(self.fx.runtime))
+        self.assertTrue(_common.runtime_is_git_ignored(self.fx.root, self.fx.runtime))
+
+    def test_comments_are_skipped_when_reading_the_pattern(self):
+        (_common.runtime_gitignore_path(self.fx.runtime)).write_text(
+            "# runtime state is private\n*\n", encoding="utf-8"
+        )
+        self.assertTrue(_common.runtime_self_ignores(self.fx.runtime))
+
+    def test_a_narrower_pattern_does_not_count_as_self_ignoring(self):
+        # `*.tmp` leaves the streams tracked, so this must not be read as a
+        # blanket ignore.
+        (_common.runtime_gitignore_path(self.fx.runtime)).write_text(
+            "*.tmp\n", encoding="utf-8"
+        )
+        self.assertFalse(_common.runtime_self_ignores(self.fx.runtime))
+
+    def test_an_empty_gitignore_is_not_self_ignoring(self):
+        (_common.runtime_gitignore_path(self.fx.runtime)).write_text(
+            "\n# nothing here\n", encoding="utf-8"
+        )
+        self.assertFalse(_common.runtime_self_ignores(self.fx.runtime))
+
+    def test_a_project_rule_counts_as_covered(self):
+        (self.fx.root / ".gitignore").write_text(
+            ".handoff-runtime/\nnode_modules/\n", encoding="utf-8"
+        )
+        self.assertTrue(_common.covered_by_project_gitignore(self.fx.root))
+        self.assertTrue(_common.runtime_is_git_ignored(self.fx.root, self.fx.runtime))
+
+    def test_an_unrelated_project_gitignore_does_not_count(self):
+        (self.fx.root / ".gitignore").write_text("node_modules/\n*.pyc\n")
+        self.assertFalse(_common.covered_by_project_gitignore(self.fx.root))
+
+    def test_commented_out_project_rule_does_not_count(self):
+        (self.fx.root / ".gitignore").write_text("# .handoff-runtime/\n")
+        self.assertFalse(_common.covered_by_project_gitignore(self.fx.root))
+
+    # -- doctor surfaces it --------------------------------------------
+
+    def test_doctor_warns_when_a_work_tree_could_commit_runtime_state(self):
+        self.make_git_work_tree()
+        out = run_tool(self.fx, "doctor.py").stdout
+        self.assertIn("is not git-ignored", out)
+
+    def test_doctor_is_quiet_once_setup_has_run(self):
+        self.make_git_work_tree()
+        (_common.runtime_gitignore_path(self.fx.runtime)).write_text(
+            "*\n", encoding="utf-8"
+        )
+        out = run_tool(self.fx, "doctor.py").stdout
+        self.assertIn("is git-ignored", out)
+        self.assertNotIn("is not git-ignored", out)
+
+    def test_doctor_stays_quiet_outside_a_git_work_tree(self):
+        # Nothing to leak into, so nagging would be noise.
+        for path in [self.fx.root, *self.fx.root.parents]:
+            if (path / ".git").exists():
+                self.skipTest(f"temporary directory sits inside a work tree at {path}")
+        out = run_tool(self.fx, "doctor.py").stdout
+        self.assertIn("not a git work tree", out)
+        self.assertNotIn("is git-ignored", out)
+        self.assertNotIn("is not git-ignored", out)
+
+    def test_doctor_does_not_flag_the_gitignore_as_runtime_cruft(self):
+        (_common.runtime_gitignore_path(self.fx.runtime)).write_text(
+            "*\n", encoding="utf-8"
+        )
+        out = run_tool(self.fx, "doctor.py").stdout
+        self.assertNotIn(".gitignore: unexpected top-level runtime file", out)
+
+    def test_strict_mode_fails_on_an_unignored_runtime(self):
+        self.make_git_work_tree()
+        result = run_tool(self.fx, "doctor.py", "--strict")
+        self.assertEqual(result.returncode, 1, result.stdout)
+
+
+class TestSetupWritesSelfIgnore(FixtureTest):
+    def test_setup_sh_installs_the_self_ignoring_gitignore(self):
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash not available")
+        handoff = self.fx.handoff
+        shutil.copy(TOOLS_DIR.parent / "setup.sh", handoff / "setup.sh")
+        result = subprocess.run(
+            [bash, str(handoff / "setup.sh")],
+            cwd=self.fx.root,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        marker = self.fx.runtime / ".gitignore"
+        self.assertTrue(marker.is_file(), "setup.sh did not create .gitignore")
+        self.assertEqual(marker.read_text(encoding="utf-8"), "*\n")
+        # Idempotent: a second run must not clobber a user's own file.
+        marker.write_text("custom\n", encoding="utf-8")
+        subprocess.run(
+            [bash, str(handoff / "setup.sh")],
+            cwd=self.fx.root,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(marker.read_text(encoding="utf-8"), "custom\n")
 
 
 if __name__ == "__main__":

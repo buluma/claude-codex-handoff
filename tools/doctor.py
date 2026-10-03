@@ -26,18 +26,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import (  # noqa: E402  (import follows the path bootstrap above)
     ID_RE,
+    RUNTIME_DIRNAME,
     STREAMS,
     cursor_path_candidates,
     find_project_root,
     iter_jsonl_lines,
     read_int,
     resolve_cursor,
+    runtime_is_git_ignored,
     side_cursor_files,
 )
 
 
 KNOWN_DIRS = {"archive", "claims", "cursors", "locks", "notes"}
 KNOWN_FILES = {
+    # Written by setup so runtime state stays out of version control.
+    ".gitignore",
     "claude-to-codex.jsonl",
     "codex-to-claude.jsonl",
     ".claude-cursor",
@@ -333,6 +337,26 @@ def check_runtime_top_level(runtime: Path, report: Report) -> None:
         )
 
 
+def check_runtime_gitignore(root: Path, runtime: Path, report: Report) -> None:
+    """Runtime state is private to the two agents and must not be committed.
+
+    Streams carry the full conversation between the sides, notes carry working
+    context, and claims carry leases, so a stray `git add .` publishes all of
+    it. Setup drops a self-ignoring `.gitignore` in the runtime dir to prevent
+    that without touching a `.gitignore` the project owns.
+    """
+    if not any((path / ".git").exists() for path in [root, *root.parents]):
+        report.info("not a git work tree; runtime state cannot reach version control")
+        return
+    if runtime_is_git_ignored(root, runtime):
+        report.info(f"{RUNTIME_DIRNAME}/ is git-ignored")
+        return
+    report.warn(
+        f"{RUNTIME_DIRNAME}/ is not git-ignored; streams, notes, and claims can be "
+        f"committed by accident. Re-run setup, or add {RUNTIME_DIRNAME}/ to a .gitignore."
+    )
+
+
 def run(root: Path, strict: bool) -> int:
     runtime = root / ".handoff-runtime"
     report = Report()
@@ -340,11 +364,12 @@ def run(root: Path, strict: bool) -> int:
     report.info(f"runtime: {runtime}")
 
     if not runtime.is_dir():
-        report.error(".handoff-runtime/ is missing; run setup before using doctor")
+        report.error(f"{RUNTIME_DIRNAME}/ is missing; run setup before using doctor")
         report.print()
         return 2
 
     check_runtime_top_level(runtime, report)
+    check_runtime_gitignore(root, runtime, report)
 
     max_c2x, messages_c2x = read_stream(runtime, "c2x", report)
     max_x2c, messages_x2c = read_stream(runtime, "x2c", report)

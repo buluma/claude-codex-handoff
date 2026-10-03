@@ -1,8 +1,8 @@
-# Codex ↔ Claude collaboration protocol v1.13
+# Codex ↔ Claude collaboration protocol v1.14
 
 This protocol defines how two AI sessions (Codex and Claude) collaborate asynchronously through the project filesystem. `.handoff/` is the copyable protocol and tools directory. `.handoff-runtime/` is the project runtime directory. The two must stay separate.
 
-This file is the current protocol. The full changelog is in `VERSION.md`. The message format field `v` is fixed at `"1.0"`. A documentation version bump does not change the message field version. v1.13 is a toolchain consolidation with no wire-format change: the four tools now share one implementation of the protocol invariants (`tools/_common.py`), and a cursor-resolution disagreement is fixed in which `poll-gate.py` and `doctor.py` read different files, so the wake gate could report `idle` while unread work sat in the queue (§6.1). v1.12 builds on v1.11 by distinguishing the idle-backoff carrier: a Codex App heartbeat may back off in 10-minute steps, while a Claude recurring cron uses an expressible 10→20→30→60 minute ladder capped at 60 minutes. Discovering, consuming, claiming, or resuming a new peer message still returns the interval directly to 10 minutes. v1.11 defines adaptive cadence: once a side discovers, consumes, claims, or resumes a new peer message, the next loop interval returns directly to 10 minutes. v1.10 builds on v1.9 with a backward-compatible deterministic pre-gate (`tools/poll-gate.py`, which decides each round's wake/idle in code rather than in the model, with optional `--proactive-every` cadence). v1.9 builds on v1.8 with per-session cursors (removing same-side multi-session head-of-line blocking), replay idempotency, lease renewal, stream archival, a trust boundary, optional liveness, and adaptive cadence. Old runtimes keep working with no migration.
+This file is the current protocol. The full changelog is in `VERSION.md`. The message format field `v` is fixed at `"1.0"`. A documentation version bump does not change the message field version. v1.14 makes `.handoff-runtime/` self-ignoring: setup writes a `.gitignore` containing `*` into it, so runtime state cannot be committed by accident without editing a `.gitignore` the project owns, and `doctor.py` warns when that file is absent (§1). v1.13 is a toolchain consolidation with no wire-format change: the four tools now share one implementation of the protocol invariants (`tools/_common.py`), and a cursor-resolution disagreement is fixed in which `poll-gate.py` and `doctor.py` read different files, so the wake gate could report `idle` while unread work sat in the queue (§6.1). v1.12 builds on v1.11 by distinguishing the idle-backoff carrier: a Codex App heartbeat may back off in 10-minute steps, while a Claude recurring cron uses an expressible 10→20→30→60 minute ladder capped at 60 minutes. Discovering, consuming, claiming, or resuming a new peer message still returns the interval directly to 10 minutes. v1.11 defines adaptive cadence: once a side discovers, consumes, claims, or resumes a new peer message, the next loop interval returns directly to 10 minutes. v1.10 builds on v1.9 with a backward-compatible deterministic pre-gate (`tools/poll-gate.py`, which decides each round's wake/idle in code rather than in the model, with optional `--proactive-every` cadence). v1.9 builds on v1.8 with per-session cursors (removing same-side multi-session head-of-line blocking), replay idempotency, lease renewal, stream archival, a trust boundary, optional liveness, and adaptive cadence. Old runtimes keep working with no migration.
 
 ---
 
@@ -55,6 +55,7 @@ When implementing or executing this protocol, follow these short rules first. Th
 ├── .claude-session          # optional
 ├── .codex-lastseen          # optional, liveness hint
 ├── .claude-lastseen         # optional
+.gitignore                 # contains `*`; self-ignores the whole runtime dir (written by setup)
 ├── cursors/                 # per-session cursors (v1.9 source of truth)
 │   ├── claude-<session>
 │   └── codex-<session>
@@ -67,7 +68,7 @@ When implementing or executing this protocol, follow these short rules first. Th
 Conventions:
 
 - `.handoff/` holds only the protocol, prompts, and helpers, and can be copied as a whole into another project.
-- `.handoff-runtime/` holds only message streams, cursors, seq files, notes, claims, archive, scratch, or monitor state. It should not be committed into a project template.
+- `.handoff-runtime/` holds only message streams, cursors, seq files, notes, claims, archive, scratch, or monitor state. It is never committed: setup writes `.handoff-runtime/.gitignore` containing `*`, which hides the whole tree including itself without modifying a `.gitignore` the project owns. `doctor.py` warns when that file is absent in a git work tree.
 - If you find message streams, cursors, notes, or claims still under `.handoff/`, reinitialize or migrate them to `.handoff-runtime/` first.
 - A cursor file is spelled `cursors/<session>` when the session id already begins with the side prefix (`claude-main`), and `cursors/<side>-<session>` when it does not. Readers accept both spellings so a runtime written either way keeps its progress; `doctor.py` reports a conflict when both exist with different values. §6.1 is normative.
 
@@ -371,7 +372,7 @@ Rules for both sides:
 
 ## 9. Reset / fresh initialization
 
-`setup.ps1` / `setup.sh` creates `.handoff-runtime/`, the streams, legacy cursor files, seq files, notes, claims, the `cursors/` directory, and `archive/`.
+`setup.ps1` / `setup.sh` creates `.handoff-runtime/`, the streams, legacy cursor files, seq files, notes, claims, the `cursors/` directory, `archive/`, and the self-ignoring `.handoff-runtime/.gitignore`.
 
 Default reset semantics:
 

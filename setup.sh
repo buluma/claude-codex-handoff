@@ -40,6 +40,14 @@ for name in .codex-cursor .codex-seq .claude-cursor .claude-seq; do
   fi
 done
 
+# Runtime state is private to the two agents: streams hold the full conversation,
+# notes hold working context, claims hold leases. A `*` pattern here hides the
+# whole tree (this file included) without editing a .gitignore the project owns.
+if [ ! -f "$RUNTIME_DIR/.gitignore" ]; then
+  printf '*\n' > "$RUNTIME_DIR/.gitignore"
+  echo "Wrote $RUNTIME_DIR/.gitignore (keeps runtime state out of version control)"
+fi
+
 for name in PROJECT.md AGENTS.md CLAUDE.md; do
   if [ -f "$PROJECT_FILES_DIR/$name" ]; then
     if [ "$FORCE_PROJECT_FILES" = "1" ] || [ ! -f "$ROOT_DIR/$name" ]; then

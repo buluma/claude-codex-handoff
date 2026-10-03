@@ -2,6 +2,14 @@
 
 Protocol documentation history for the Codex ↔ Claude collaboration kit. The current version is the title on line 1 of `PROTOCOL.md`, in two-part `MAJOR.MINOR` form.
 
+## v1.14 — 2026-10-03
+
+Runtime state is no longer committable by accident, and one duplicated root lookup is gone. The wire format is unchanged, so old runtimes keep working with no migration.
+
+- **`.handoff-runtime/` was one `git add .` away from being published.** Setup never registered the runtime directory with version control, and the README asked the user to do it by hand, so the usual case was that it was simply forgotten. The streams hold the full conversation between the two sides, `notes/` holds working context and quoted source, and `claims/` holds leases — a leak into a shared repository, and a permanent merge-conflict source, since both sides append to the same JSONL files. Setup now writes `.handoff-runtime/.gitignore` containing `*`. A `*` pattern inside the directory hides the whole tree, that file included, so this works without editing a `.gitignore` the project owns and without a `git rm --cached` dance. Existing setups are fixed by re-running setup; an existing file is never overwritten.
+- `doctor.py` reports the state: `WARN` when a git work tree could commit runtime state, `INFO` once setup has run, and `INFO` when the project is not a work tree at all, where nagging would be noise. `--strict` therefore fails on an unignored runtime.
+- `archive.py` re-implemented the `.handoff-runtime` lookup that `_common.runtime_dir()` already provided, including a duplicate copy of its "run setup" message. This was the one duplicate the v1.13 consolidation missed; the lookup now goes through the shared function like the other three tools.
+
 ## v1.13 — 2026-10-03
 
 Toolchain consolidation and bugfixes. The wire format is unchanged, so old runtimes keep working with no migration.

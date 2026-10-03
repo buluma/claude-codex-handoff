@@ -37,6 +37,7 @@ jobs:
           workdir="$(mktemp -d)"
           mkdir -p "$workdir/.handoff"
           cp setup.sh "$workdir/.handoff/"
+          cp -R project-files "$workdir/.handoff/"
           cd "$workdir"
           bash .handoff/setup.sh
           for d in notes claims locks cursors archive; do

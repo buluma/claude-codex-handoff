@@ -6,7 +6,7 @@
 
 1. Read `PROJECT.md`.
 2. Read `.handoff/PROTOCOL.md`.
-3. Confirm `.handoff-runtime/` is initialized. This session's consumption cursor is `.handoff-runtime/cursors/codex-<MY_SESSION>` (if it is missing, seed it from the legacy `.codex-cursor`, default `0`). `.codex-seq` starts at `0`.
+3. Confirm `.handoff-runtime/` is initialized. This session's consumption cursor is `.handoff-runtime/cursors/codex-<MY_SESSION>` (drop the `codex-` prefix when `<MY_SESSION>` already starts with it; §6.1) (if it is missing, seed it from the legacy `.codex-cursor`, default `0`). `.codex-seq` starts at `0`.
 4. Before processing tasks each round, read `.handoff-runtime/claude-to-codex.jsonl` and consume unread messages under the protocol.
 
 If `PROJECT.md` still contains `<FILL_IN>` markers, the project is not initialized. Ask the user for the project name, a one-line description, key conventions, the current focus, and the kinds of tasks Codex should take on. Write that back to `PROJECT.md`, then continue the collaboration flow.
@@ -34,7 +34,7 @@ This project uses Claude ↔ Codex asynchronous collaboration. The protocol is `
 - Resolve the current Codex session id under `.handoff/PROTOCOL.md` §3.1, preferring `.handoff-runtime/.codex-session`. When sending, the helper writes `from_session` automatically. With `--reply-to`, it automatically points `to_session` back at the original sender session.
 - If an inbound message has `to_session` and it is not the current `MY_SESSION`, it is a direct message for another session on the same side. Skip it and advance this session's cursor. Do not take a claim. Do not stop the round. The target session has its own cursor and will not miss it.
 - Prefer `.handoff/tools/send.py` when sending:
-  - `python .handoff/tools/send.py --side codex --type status --summary "..."`
+- `python .handoff/tools/send.py --side codex --type status --summary "..."`
 - Before sending, the helper should take `max(.handoff-runtime/.codex-seq, x2c max seq)+1`, then persist it after the send.
 - Write long content to `.handoff-runtime/notes/<msg-id>.md` and reference it in `refs.notes_file`.
 - Hand-written JSONL is only a fallback when the helper is unavailable.
@@ -43,7 +43,7 @@ This project uses Claude ↔ Codex asynchronous collaboration. The protocol is `
 ## Monitor practice
 
 - **Persistent automation**: the Codex side uses the Codex App heartbeat on the current thread. Do not use Windows Task Scheduler, PowerShell `Start-Job` / `Start-Process`, `pythonw`, or any other unverifiable long-running background process.
-- **Consume immediately**: before actually processing tasks each round, fresh-read `.handoff-runtime/claude-to-codex.jsonl`. Decide consumption from `.handoff-runtime/cursors/codex-<MY_SESSION>`, and process unconsumed messages under the protocol. If `to_session` points at another Codex session, skip it and advance this session's cursor.
+- **Consume immediately**: before actually processing tasks each round, fresh-read `.handoff-runtime/claude-to-codex.jsonl`. Decide consumption from `.handoff-runtime/cursors/codex-<MY_SESSION>` (named per §6.1), and process unconsumed messages under the protocol. If `to_session` points at another Codex session, skip it and advance this session's cursor.
 - Each round, process every inbound message that can be finished immediately, in seq order. Do not wait for the next activation just because you already handled 1 lease message.
 - If the cursor is sitting in front of a large task whose unexpired claim is already held by the current `MY_SESSION`, later heartbeats should resume that task. Do not treat your own claim as a block. Advance the cursor only after the whole inbound message is finished. Report partial output with `status state="progress"`.
 - Inbound messages that need a lease: `task` / `handoff` / `question` / `cancel` / `error`.

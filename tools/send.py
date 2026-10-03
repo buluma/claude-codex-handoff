@@ -9,90 +9,47 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
-import tempfile
-import time
-from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+# Put this file's directory first so `import _common` works no matter how the
+# tool is invoked (script path, symlink, or copied elsewhere on sys.path).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _common import (  # noqa: E402  (import follows the path bootstrap above)
+    HandoffError,
+    SendLock,
+    SUMMARY_MAX,
+    SUMMARY_MIN_ROOM,
+    SUMMARY_SPILL,
+    append_jsonl,
+    atomic_write_text,
+    find_project_root,
+    max_seq,
+    now_iso,
+    parse_msg_seq,
+    read_jsonl,
+    read_seq_file,
+    resolve_session_id,
+    runtime_dir,
+    side_paths,
+    validate_session_id,
+    write_new_file,
+)
+
 
 VALID_TYPES = {"task", "handoff", "done", "status", "question", "error", "cancel"}
-VALID_SIDES = {"codex", "claude"}
 VALID_STATES = {"claimed", "progress", "blocked", "awaiting-input", "shutdown"}
 TERMINAL_TYPES = {"done", "error", "cancel"}
-ID_RE = re.compile(r"^(codex|claude)-\d{6,}$")
+
 DURATION_RE = re.compile(
     r"^P((\d+D)(T(\d+H(\d+M)?(\d+S)?|\d+M(\d+S)?|\d+S))?|"
     r"T(\d+H(\d+M)?(\d+S)?|\d+M(\d+S)?|\d+S))$"
 )
-SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
-SEND_LOCK_TIMEOUT_SECONDS = 30.0
-SEND_LOCK_STALE_SECONDS = 600.0
 
-
-class HandoffError(Exception):
-    pass
-
-
-class SendLock:
-    def __init__(self, runtime: Path, side: str) -> None:
-        self.path = runtime / "locks" / f"{side}-send.lock"
-        self.side = side
-        self.acquired = False
-
-    def __enter__(self) -> "SendLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.monotonic() + SEND_LOCK_TIMEOUT_SECONDS
-        while True:
-            try:
-                flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-                if hasattr(os, "O_BINARY"):
-                    flags |= os.O_BINARY
-                fd = os.open(self.path, flags, 0o666)
-                try:
-                    payload = {
-                        "side": self.side,
-                        "pid": os.getpid(),
-                        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
-                    }
-                    os.write(fd, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                self.acquired = True
-                return self
-            except FileExistsError:
-                if self._try_remove_stale():
-                    continue
-                if time.monotonic() >= deadline:
-                    raise HandoffError(f"timed out waiting for send lock: {self.path}")
-                time.sleep(0.1)
-
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        if not self.acquired:
-            return
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            pass
-
-    def _try_remove_stale(self) -> bool:
-        try:
-            age = time.time() - self.path.stat().st_mtime
-        except FileNotFoundError:
-            return True
-        if age < SEND_LOCK_STALE_SECONDS:
-            return False
-        try:
-            self.path.unlink()
-            return True
-        except FileNotFoundError:
-            return True
-        except OSError:
-            return False
+DUPLICATE_SCAN_WINDOW = 50
 
 
 def utf8_stdout() -> None:
@@ -102,109 +59,23 @@ def utf8_stdout() -> None:
         sys.stderr.reconfigure(encoding="utf-8")
 
 
-def find_project_root(start: Path) -> Path:
-    current = start.resolve()
-    for path in [current, *current.parents]:
-        if (path / ".handoff").is_dir():
-            return path
-    raise HandoffError("could not find project root containing .handoff")
+def next_local_seq(seq_path: Path, outbox: Path) -> int:
+    """PROTOCOL.md 5: max(.<side>-seq, real outbox max seq) + 1.
+
+    Consulting the outbox as well recovers from a seq file that was reset or
+    lost, so a restored-from-backup stream cannot reissue an existing id.
+    """
+    return max(read_seq_file(seq_path), max_seq(outbox)) + 1
 
 
-def runtime_dir(root: Path) -> Path:
-    runtime = root / ".handoff-runtime"
-    if not runtime.is_dir():
-        raise HandoffError("could not find .handoff-runtime; run .handoff/setup.ps1")
-    return runtime
-
-
-def side_paths(handoff: Path, side: str) -> tuple[Path, Path, Path]:
-    if side == "codex":
-        return (
-            handoff / ".codex-seq",
-            handoff / "codex-to-claude.jsonl",
-            handoff / "claude-to-codex.jsonl",
-        )
-    if side == "claude":
-        return (
-            handoff / ".claude-seq",
-            handoff / "claude-to-codex.jsonl",
-            handoff / "codex-to-claude.jsonl",
-        )
-    raise HandoffError(f"invalid side: {side}")
-
-
-def read_seq(path: Path) -> int:
-    if not path.exists():
-        return 0
-    text = path.read_text(encoding="utf-8").strip()
-    return int(text or "0")
-
-
-def atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
-
-
-def append_jsonl(path: Path, obj: dict[str, Any]) -> None:
-    payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
-    flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-    if hasattr(os, "O_BINARY"):
-        flags |= os.O_BINARY
-    fd = os.open(path, flags, 0o666)
-    try:
-        os.write(fd, payload.encode("utf-8"))
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def iter_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    messages: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                messages.append(value)
-    return messages
-
-
-def max_seq(path: Path) -> int:
-    max_seen = 0
-    for msg in iter_jsonl(path):
-        msg_id = str(msg.get("id", ""))
-        if "-" not in msg_id:
-            continue
-        try:
-            seq = int(msg_id.rsplit("-", 1)[1])
-        except ValueError:
-            continue
-        max_seen = max(max_seen, seq)
-    return max_seen
-
-
-def infer_thread(reply_to: str | None, explicit: str | None, streams: list[Path], fallback: str) -> str:
+def infer_thread(
+    reply_to: str | None, explicit: str | None, streams: list[Path], fallback: str
+) -> str:
     if explicit:
         return explicit
     if reply_to:
         for stream in streams:
-            for msg in iter_jsonl(stream):
+            for msg in read_jsonl(stream):
                 if msg.get("id") == reply_to:
                     thread = msg.get("thread")
                     if isinstance(thread, str) and thread:
@@ -217,40 +88,10 @@ def find_message(message_id: str | None, streams: list[Path]) -> dict[str, Any] 
     if not message_id:
         return None
     for stream in streams:
-        for msg in iter_jsonl(stream):
+        for msg in read_jsonl(stream):
             if msg.get("id") == message_id:
                 return msg
     return None
-
-
-def validate_session_id(value: Any, field: str) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value:
-        return f"{field} must be a non-empty string"
-    if not SESSION_RE.match(value):
-        return f"{field} must be 1-64 ASCII chars: letters, digits, _, -, ., :"
-    return None
-
-
-def resolve_session_id(args: argparse.Namespace, runtime: Path) -> str:
-    candidates: list[str | None] = [
-        args.session,
-        os.environ.get("HANDOFF_SESSION_ID"),
-        os.environ.get(f"{args.side.upper()}_SESSION_ID"),
-    ]
-    session_file = runtime / f".{args.side}-session"
-    if session_file.exists():
-        candidates.append(session_file.read_text(encoding="utf-8").strip())
-    candidates.append(f"{args.side}-default")
-    for candidate in candidates:
-        if not candidate:
-            continue
-        error = validate_session_id(candidate, "session")
-        if error:
-            raise HandoffError(error)
-        return candidate
-    raise HandoffError("could not resolve session id")
 
 
 def infer_to_session(
@@ -284,7 +125,11 @@ def read_context(args: argparse.Namespace) -> str | None:
     if args.context:
         parts.append(args.context)
     if args.context_file:
-        parts.append(Path(args.context_file).read_text(encoding="utf-8"))
+        path = Path(args.context_file)
+        try:
+            parts.append(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise HandoffError(f"--context-file cannot be read: {exc}") from exc
     if args.context_stdin:
         parts.append(sys.stdin.read())
     if not parts:
@@ -325,24 +170,10 @@ def parse_skipped(values: list[str] | None) -> list[dict[str, str]] | None:
 
 
 def truncate_summary(summary: str, note_rel: str) -> str:
+    """Shrink `summary` to fit the single-line limit, pointing at the note."""
     suffix = f"... see {note_rel}"
-    room = 180 - len(suffix)
-    if room < 20:
-        room = 20
+    room = max(SUMMARY_MIN_ROOM, SUMMARY_SPILL - len(suffix))
     return summary[:room].rstrip() + suffix
-
-
-def fsync_note(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    if hasattr(os, "O_BINARY"):
-        flags |= os.O_BINARY
-    fd = os.open(path, flags, 0o666)
-    try:
-        os.write(fd, text.encode("utf-8"))
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def validate_notes_file(value: Any) -> str | None:
@@ -381,15 +212,27 @@ def resolve_note_path(runtime: Path, value: Any) -> Path:
 def validate_message(msg: dict[str, Any]) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
-    required = ["v", "id", "ts", "from", "type", "thread", "summary", "blocking", "refs"]
+    required = [
+        "v",
+        "id",
+        "ts",
+        "from",
+        "type",
+        "thread",
+        "summary",
+        "blocking",
+        "refs",
+    ]
     for key in required:
         if key not in msg:
             errors.append(f"missing {key}")
     if msg.get("v") != "1.0":
         errors.append("v must be 1.0")
-    if not isinstance(msg.get("id"), str) or not ID_RE.match(str(msg.get("id"))):
+    if parse_msg_seq(msg.get("id")) is None:
         errors.append("id is invalid")
-    if msg.get("from") not in VALID_SIDES:
+    elif not str(msg.get("id")).startswith(f"{msg.get('from')}-"):
+        errors.append("id side does not match from")
+    if msg.get("from") not in {"codex", "claude"}:
         errors.append("from is invalid")
     for field in ["from_session", "to_session"]:
         error = validate_session_id(msg.get(field), field)
@@ -397,7 +240,10 @@ def validate_message(msg: dict[str, Any]) -> tuple[list[str], list[str]]:
             errors.append(error)
     if msg.get("type") not in VALID_TYPES:
         errors.append("type is invalid")
-    if not isinstance(msg.get("thread"), str) or not ID_RE.match(str(msg.get("thread"))):
+    if (
+        not isinstance(msg.get("thread"), str)
+        or parse_msg_seq(msg.get("thread")) is None
+    ):
         errors.append("thread is invalid")
     summary = msg.get("summary")
     if not isinstance(summary, str):
@@ -405,10 +251,10 @@ def validate_message(msg: dict[str, Any]) -> tuple[list[str], list[str]]:
     else:
         if "\n" in summary or "\r" in summary:
             errors.append("summary must be single-line")
-        if len(summary) > 200:
-            errors.append("summary exceeds 200 characters")
-        if len(summary) > 180:
-            warnings.append("summary is longer than 180 characters")
+        if len(summary) > SUMMARY_MAX:
+            errors.append(f"summary exceeds {SUMMARY_MAX} characters")
+        elif len(summary) > SUMMARY_SPILL:
+            warnings.append(f"summary is longer than {SUMMARY_SPILL} characters")
     if not isinstance(msg.get("blocking"), bool):
         errors.append("blocking must be boolean")
     refs_obj = msg.get("refs")
@@ -419,9 +265,9 @@ def validate_message(msg: dict[str, Any]) -> tuple[list[str], list[str]]:
         for key in ["reply_to", "notes_file", "commit"]:
             if key not in refs:
                 errors.append(f"refs.{key} missing")
-        note_error = validate_notes_file(refs.get("notes_file"))
-        if note_error:
-            errors.append(note_error)
+    note_error = validate_notes_file(refs.get("notes_file"))
+    if note_error:
+        errors.append(note_error)
     msg_type = msg.get("type")
     if msg_type in {"done", "cancel"} and not refs.get("reply_to"):
         errors.append(f"{msg_type} requires refs.reply_to")
@@ -455,8 +301,10 @@ def validate_message(msg: dict[str, Any]) -> tuple[list[str], list[str]]:
                     errors.append(f"skipped[{index}].id must be a non-empty string")
                 if not isinstance(reason, str) or not reason:
                     errors.append(f"skipped[{index}].reason must be a non-empty string")
-                elif "\n" in reason or "\r" in reason or len(reason) > 200:
-                    errors.append(f"skipped[{index}].reason must be single-line and <=200 chars")
+                elif "\n" in reason or "\r" in reason or len(reason) > SUMMARY_MAX:
+                    errors.append(
+                        f"skipped[{index}].reason must be single-line and <={SUMMARY_MAX} chars"
+                    )
     for field in ["expected_within", "eta"]:
         value = msg.get(field)
         if value is not None and not DURATION_RE.match(str(value)):
@@ -465,24 +313,25 @@ def validate_message(msg: dict[str, Any]) -> tuple[list[str], list[str]]:
 
 
 def duplicate_warnings(outbox: Path, msg: dict[str, Any]) -> list[str]:
+    """PROTOCOL.md 5 / 6.3: warn when a terminal reply would be re-sent."""
     reply_to = msg.get("refs", {}).get("reply_to")
     if not reply_to or msg.get("type") not in TERMINAL_TYPES:
         return []
     hits: list[str] = []
-    for old in iter_jsonl(outbox)[-50:]:
-        if old.get("type") == msg.get("type") and old.get("refs", {}).get("reply_to") == reply_to:
+    for old in read_jsonl(outbox)[-DUPLICATE_SCAN_WINDOW:]:
+        if (
+            old.get("type") == msg.get("type")
+            and old.get("refs", {}).get("reply_to") == reply_to
+        ):
             hits.append(str(old.get("id")))
     if not hits:
         return []
     return [f"recent duplicate {msg.get('type')} for {reply_to}: {', '.join(hits)}"]
 
 
-def next_local_seq(seq_path: Path, outbox: Path) -> int:
-    """Recover from a stale seq file by also consulting the real outbox."""
-    return max(read_seq(seq_path), max_seq(outbox)) + 1
-
-
-def build_message(args: argparse.Namespace, runtime: Path) -> tuple[dict[str, Any], Path, Path, str | None]:
+def build_message(
+    args: argparse.Namespace, runtime: Path
+) -> tuple[dict[str, Any], Path, Path, str | None]:
     seq_path, outbox, peer_stream = side_paths(runtime, args.side)
     next_seq = next_local_seq(seq_path, outbox)
     msg_id = f"{args.side}-{next_seq:06d}"
@@ -495,7 +344,8 @@ def build_message(args: argparse.Namespace, runtime: Path) -> tuple[dict[str, An
     }
     summary = args.summary
     note_text: str | None = None
-    if len(summary) > 180:
+    if len(summary) > SUMMARY_SPILL:
+        # Spill the full text into a note so nothing is silently dropped.
         note_rel = refs["notes_file"] or f"notes/{msg_id}.md"
         note_text = "# Original summary\n\n" + summary + "\n"
         if context:
@@ -503,13 +353,23 @@ def build_message(args: argparse.Namespace, runtime: Path) -> tuple[dict[str, An
             context = None
         refs["notes_file"] = note_rel
         summary = truncate_summary(summary, note_rel)
+    elif args.notes_file and not Path(runtime / args.notes_file).is_file():
+        # Referencing a note that does not exist leaves the peer with a dead
+        # ref, which doctor.py would only report much later with no cause.
+        print(
+            f"WARN: refs.notes_file {args.notes_file} does not exist yet; "
+            "write it before sending, or drop the flag",
+            file=sys.stderr,
+        )
     thread = infer_thread(args.reply_to, args.thread, streams, msg_id)
-    from_session = resolve_session_id(args, runtime)
-    to_session = infer_to_session(args.reply_to, args.to_session, args.broadcast, streams)
+    from_session = resolve_session_id(args.side, args.session, runtime)
+    to_session = infer_to_session(
+        args.reply_to, args.to_session, args.broadcast, streams
+    )
     msg: dict[str, Any] = {
         "v": "1.0",
         "id": msg_id,
-        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "ts": now_iso(),
         "from": args.side,
         "from_session": from_session,
         "type": args.type,
@@ -546,19 +406,26 @@ def build_message(args: argparse.Namespace, runtime: Path) -> tuple[dict[str, An
     ]:
         if values:
             msg[key] = values
-    else:
-        msg.setdefault("files_changed", [])
     return msg, seq_path, outbox, note_text
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Send one .handoff JSONL message")
-    parser.add_argument("--side", required=True, choices=sorted(VALID_SIDES))
+    parser.add_argument("--side", required=True, choices=["claude", "codex"])
     parser.add_argument("--type", required=True, choices=sorted(VALID_TYPES))
     parser.add_argument("--summary", required=True)
-    parser.add_argument("--session", help="Current session id. Defaults to env or .handoff-runtime/.<side>-session.")
-    parser.add_argument("--to-session", help="Direct this message to a specific peer session.")
-    parser.add_argument("--broadcast", action="store_true", help="Do not infer to_session from --reply-to.")
+    parser.add_argument(
+        "--session",
+        help="Current session id. Defaults to env or .handoff-runtime/.<side>-session.",
+    )
+    parser.add_argument(
+        "--to-session", help="Direct this message to a specific peer session."
+    )
+    parser.add_argument(
+        "--broadcast",
+        action="store_true",
+        help="Do not infer to_session from --reply-to.",
+    )
     parser.add_argument("--thread")
     parser.add_argument("--reply-to")
     parser.add_argument("--notes-file")
@@ -578,11 +445,44 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--state", choices=sorted(VALID_STATES))
     parser.add_argument("--eta")
     parser.add_argument("--applied", type=int)
-    parser.add_argument("--skipped", action="append", help="Repeatable. JSON object or ID=REASON.")
+    parser.add_argument(
+        "--skipped", action="append", help="Repeatable. JSON object or ID=REASON."
+    )
     parser.add_argument("--total-proposed", type=int)
     parser.add_argument("--peer-cursor-observed", type=int)
     parser.add_argument("--dry-run", "--verify", dest="dry_run", action="store_true")
     return parser.parse_args(argv)
+
+
+def write_message(args: argparse.Namespace, runtime: Path, dry_run: bool) -> int:
+    msg, seq_path, outbox, note_text = build_message(args, runtime)
+    errors, warnings = validate_message(msg)
+    warnings.extend(duplicate_warnings(outbox, msg))
+    for warning in warnings:
+        print(f"WARN: {warning}", file=sys.stderr)
+    if errors:
+        for error in errors:
+            print(f"FATAL: {error}", file=sys.stderr)
+        print(json.dumps(msg, ensure_ascii=False, indent=2))
+        return 2
+    print(json.dumps(msg, ensure_ascii=False, indent=2))
+    if dry_run:
+        print(f"DRY-RUN: would write {msg['id']} to {outbox}")
+        if note_text:
+            print(f"DRY-RUN: would write {msg['refs']['notes_file']}")
+        return 0
+    if note_text:
+        note_path = resolve_note_path(runtime, msg["refs"]["notes_file"])
+        if not write_new_file(note_path, note_text):
+            # PROTOCOL.md 6.3: a replay reuses the note instead of failing.
+            print(
+                f"WARN: note {msg['refs']['notes_file']} already exists; reusing it",
+                file=sys.stderr,
+            )
+    append_jsonl(outbox, msg)
+    atomic_write_text(seq_path, f"{int(msg['id'].rsplit('-', 1)[1])}\n")
+    print(f"WROTE {msg['id']} to {outbox}")
+    return 0
 
 
 def main(argv: list[str]) -> int:
@@ -594,32 +494,6 @@ def main(argv: list[str]) -> int:
         return write_message(args, runtime, dry_run=True)
     with SendLock(runtime, args.side):
         return write_message(args, runtime, dry_run=False)
-
-
-def write_message(args: argparse.Namespace, runtime: Path, dry_run: bool) -> int:
-    msg, seq_path, outbox, note_text = build_message(args, runtime)
-    errors, warnings = validate_message(msg)
-    warnings.extend(duplicate_warnings(outbox, msg))
-    if errors:
-        for error in errors:
-            print(f"FATAL: {error}", file=sys.stderr)
-        print(json.dumps(msg, ensure_ascii=False, indent=2))
-        return 2
-    for warning in warnings:
-        print(f"WARN: {warning}", file=sys.stderr)
-    print(json.dumps(msg, ensure_ascii=False, indent=2))
-    if dry_run:
-        print(f"DRY-RUN: would write {msg['id']} to {outbox}")
-        if note_text:
-            print(f"DRY-RUN: would write {msg['refs']['notes_file']}")
-        return 0
-    if note_text:
-        note_path = resolve_note_path(runtime, msg["refs"]["notes_file"])
-        fsync_note(note_path, note_text)
-    append_jsonl(outbox, msg)
-    atomic_write_text(seq_path, str(int(msg["id"].rsplit("-", 1)[1])))
-    print(f"WROTE {msg['id']} to {outbox}")
-    return 0
 
 
 if __name__ == "__main__":

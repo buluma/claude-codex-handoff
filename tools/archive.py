@@ -17,123 +17,96 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
+import json
 import sys
-import tempfile
-import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-# stream key -> (filename, writer side, reader side)
-STREAMS = {
-    "c2x": ("claude-to-codex.jsonl", "claude", "codex"),
-    "x2c": ("codex-to-claude.jsonl", "codex", "claude"),
-}
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-LOCK_TIMEOUT_SECONDS = 30.0
-LOCK_STALE_SECONDS = 600.0
-
-
-class ArchiveError(Exception):
-    pass
+from _common import (  # noqa: E402  (import follows the path bootstrap above)
+    HandoffError,
+    SendLock,
+    STREAMS,
+    atomic_write_text,
+    find_project_root,
+    iter_jsonl_lines,
+    parse_msg_seq,
+    read_int,
+)
 
 
 def find_runtime(start: Path) -> Path:
-    current = start.resolve()
-    for candidate in [current, *current.parents]:
-        runtime = candidate / ".handoff-runtime"
-        if runtime.is_dir():
-            return runtime
-    raise ArchiveError("could not find .handoff-runtime; run .handoff/setup.ps1")
-
-
-def seq_of(line: str) -> int | None:
-    line = line.strip()
-    if not line:
-        return None
-    try:
-        import json
-
-        msg = json.loads(line)
-        mid = str(msg["id"])
-        return int(mid.rsplit("-", 1)[1])
-    except Exception:
-        return None
-
-
-def read_cursor(path: Path) -> int | None:
-    try:
-        text = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    if not text:
-        return None
-    try:
-        return int(text)
-    except ValueError:
-        return None
+    root = find_project_root(start)
+    runtime = root / ".handoff-runtime"
+    if not runtime.is_dir():
+        raise HandoffError(
+            "could not find .handoff-runtime; run bash .handoff/setup.sh "
+            "(Windows: powershell -ExecutionPolicy Bypass -File .handoff\\setup.ps1)"
+        )
+    return runtime
 
 
 def reader_archive_point(runtime: Path, reader_side: str) -> int | None:
-    """Min consumed seq across all reader-side cursors. None if no reader cursor."""
-    values: list[int] = []
+    """Minimum consumed seq across every reader-side session cursor.
+
+    None when no reader cursor exists at all, in which case archiving anything
+    could drop an unconsumed line, so we skip (PROTOCOL.md §13).
+    """
     cursors_dir = runtime / "cursors"
     if cursors_dir.is_dir():
-        for f in cursors_dir.iterdir():
-            if f.is_file() and f.name.startswith(reader_side + "-"):
-                v = read_cursor(f)
-                if v is not None:
-                    values.append(v)
-    if values:
-        return min(values)
-    # No per-session cursor yet (e.g. pre-v1.9 runtime): fall back to the legacy
-    # shared cursor. Once per-session cursors exist they are the source of truth.
-    return read_cursor(runtime / f".{reader_side}-cursor")
+        values = []
+        for path in cursors_dir.iterdir():
+            if path.is_file() and path.name.startswith(reader_side + "-"):
+                value = read_int(path)
+                if value is not None:
+                    values.append(value)
+        if values:
+            return min(values)
+    # No per-session cursor yet (pre-v1.9 runtime): fall back to the legacy
+    # shared anchor. Once per-session cursors exist they are the source of truth.
+    return read_int(runtime / f".{reader_side}-cursor")
 
 
-def atomic_write(path: Path, data: str) -> None:
-    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+def _seq_of(line: str) -> int | None:
+    """Seq of a JSONL line, or None when the line is unusable."""
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+        msg = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(msg, dict):
+        return None
+    return parse_msg_seq(msg.get("id"))
 
 
-class SendLock:
-    """Same lock file send.py uses, so archiving serializes against sends."""
+def partition(
+    stream: Path, point: int
+) -> tuple[list[str], list[str], list[int], int | None]:
+    """Split a stream into (to_archive, retained, bad lines, newest seq).
 
-    def __init__(self, runtime: Path, side: str) -> None:
-        self.path = runtime / "locks" / f"{side}-send.lock"
+    A line is archived only when its seq is known, at or below `point`, and is
+    not the newest line in the stream. A line with no parseable id has no seq,
+    so it is always retained rather than guessed at.
+    """
+    entries: list[tuple[int | None, str]] = []
+    bad: list[int] = []
+    for line_no, line in iter_jsonl_lines(stream):
+        seq = _seq_of(line)
+        if seq is None:
+            bad.append(line_no)
+        entries.append((seq, line))
 
-    def __enter__(self) -> "SendLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
-        while True:
-            try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
-                os.close(fd)
-                return self
-            except FileExistsError:
-                try:
-                    age = time.time() - self.path.stat().st_mtime
-                    if age > LOCK_STALE_SECONDS:
-                        os.unlink(self.path)
-                        continue
-                except OSError:
-                    pass
-                if time.monotonic() > deadline:
-                    raise ArchiveError(f"could not acquire {self.path} within {LOCK_TIMEOUT_SECONDS}s")
-                time.sleep(0.1)
+    known = [seq for seq, _ in entries if seq is not None]
+    newest = max(known) if known else None
 
-    def __exit__(self, *exc) -> None:
-        try:
-            os.unlink(self.path)
-        except OSError:
-            pass
+    to_archive: list[str] = []
+    retained: list[str] = []
+    for seq, line in entries:
+        if seq is not None and seq <= point and (newest is None or seq < newest):
+            to_archive.append(line)
+        else:
+            retained.append(line)
+    return to_archive, retained, bad, newest
 
 
 def archive_stream(runtime: Path, key: str, dry_run: bool) -> str:
@@ -149,40 +122,69 @@ def archive_stream(runtime: Path, key: str, dry_run: bool) -> str:
         return f"{key}: reader at seq {point}, nothing consumed, skip"
 
     with SendLock(runtime, writer_side):
-        lines = stream.read_text(encoding="utf-8").splitlines()
-        parsed = [(seq_of(l), l) for l in lines if l.strip()]
-        if not parsed:
-            return f"{key}: empty, skip"
-        max_seq = max(s for s, _ in parsed if s is not None)
-        to_archive = [l for s, l in parsed if s is not None and s <= point and s != max_seq]
-        retained = [l for s, l in parsed if not (s is not None and s <= point and s != max_seq)]
+        to_archive, retained, bad, newest = partition(stream, point)
+        if bad:
+            # A line we cannot read has no seq, so we cannot prove any reader
+            # consumed it. Refuse rather than risk dropping it.
+            return (
+                f"{key}: {len(bad)} line(s) have no parseable id "
+                f"(first at line {bad[0]}); refusing to archive, run doctor.py"
+            )
         if not to_archive:
-            return f"{key}: archive_point={point}, nothing below it (keeping latest seq {max_seq}), skip"
+            return (
+                f"{key}: archive_point={point}, nothing below it "
+                f"(newest seq {newest}); skip"
+            )
         if dry_run:
-            return f"{key}: would archive {len(to_archive)} line(s) (seq<= {point}), keep {len(retained)} (DRY-RUN)"
+            return (
+                f"{key}: would archive {len(to_archive)} line(s) (seq<= {point}), "
+                f"keep {len(retained)} (DRY-RUN)"
+            )
 
-        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        ts = _timestamp()
         archive_path = runtime / "archive" / f"{filename}.{ts}.jsonl"
         archive_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write(archive_path, "\n".join(to_archive) + "\n")
-        atomic_write(stream, ("\n".join(retained) + "\n") if retained else "")
-        return f"{key}: archived {len(to_archive)} line(s) -> archive/{archive_path.name}, kept {len(retained)}"
+        atomic_write_text(archive_path, "\n".join(to_archive) + "\n")
+        atomic_write_text(stream, ("\n".join(retained) + "\n") if retained else "")
+        return (
+            f"{key}: archived {len(to_archive)} line(s) -> "
+            f"archive/{archive_path.name}, kept {len(retained)}"
+        )
+
+
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Archive consumed handoff stream prefix (PROTOCOL.md §13)."
+    )
+    parser.add_argument(
+        "--stream", choices=sorted(STREAMS), help="Only this stream; default both."
+    )
+    parser.add_argument(
+        "--root", type=Path, help="Project root; defaults to auto-detected."
+    )
+    parser.add_argument("--dry-run", "--verify", dest="dry_run", action="store_true")
+    return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Archive consumed handoff stream prefix (PROTOCOL.md §13).")
-    parser.add_argument("--stream", choices=sorted(STREAMS), help="Only this stream; default both.")
-    parser.add_argument("--dry-run", "--verify", dest="dry_run", action="store_true")
-    args = parser.parse_args(argv)
-
+    args = parse_args(argv)
     try:
-        runtime = find_runtime(Path.cwd())
-        keys = [args.stream] if args.stream else list(STREAMS)
-        for key in keys:
-            print(archive_stream(runtime, key, args.dry_run))
-    except ArchiveError as exc:
+        runtime = find_runtime(args.root.resolve() if args.root else Path.cwd())
+    except HandoffError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 1
+        return 2
+
+    keys = [args.stream] if args.stream else list(STREAMS)
+    for key in keys:
+        try:
+            print(archive_stream(runtime, key, args.dry_run))
+        except HandoffError as exc:
+            print(f"error: {key}: {exc}", file=sys.stderr)
+            return 2
     return 0
 
 

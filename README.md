@@ -1,15 +1,8 @@
 # Claude ↔ Codex Handoff
 
-A drop-in kit that lets two AI coding agents — for example **Claude Code** and
-**Codex** — collaborate asynchronously inside one repository. They talk through
-append-only files: one message stream per direction, atomic leases, and
-per-session cursors with legacy shared cursor anchors. No server, no daemon.
-Each side wakes on a timer, processes unread
-messages, optionally hands work back, and exits.
+A drop-in kit that lets two AI coding agents — for example **Claude Code** and **Codex** — collaborate asynchronously inside one repository. They talk through append-only files: one message stream per direction, atomic leases, and per-session cursors with legacy shared cursor anchors. No server, no daemon. Each side wakes on a timer, processes unread messages, optionally hands work back, and exits.
 
-It installs as a single **`.handoff/` folder in your project**, shared by both
-agents. There is no separate global "skill" copy to keep in sync — Claude Code
-and Codex read the same files.
+It installs as a single **`.handoff/` folder in your project**, shared by both agents. There is no separate global "skill" copy to keep in sync — Claude Code and Codex read the same files.
 
 ## Install (into your project)
 
@@ -25,24 +18,11 @@ bash .handoff/setup.sh
 powershell -ExecutionPolicy Bypass -File .handoff\setup.ps1
 ```
 
-Don't want to type the shell command yourself? Open the project in **Claude
-Code** or **Codex** and ask the agent to **run `.handoff/setup.sh`** (Windows:
-**`.handoff\setup.ps1`**) — it can see the script in your tree and will run it
-for you. Setup is what copies `CLAUDE.md` / `AGENTS.md` into your project root;
-*after* that the agents have an entry file, so saying **"start collaboration"** (or
-**`costart`**) kicks off the actual collaboration — see [Quick start](#quick-start-start-a-collaboration)
-below. (Before setup runs, a bare "start collaboration" won't work: with no root entry file
-yet, the agent has no way to know `.handoff/` exists.)
+Don't want to type the shell command yourself? Open the project in **Claude Code** or **Codex** and ask the agent to **run `.handoff/setup.sh`** (Windows: **`.handoff\setup.ps1`**) — it can see the script in your tree and will run it for you. Setup is what copies `CLAUDE.md` / `AGENTS.md` into your project root; _after_ that the agents have an entry file, so saying **"start collaboration"** (or **`costart`**) kicks off the actual collaboration — see [Quick start](#quick-start-start-a-collaboration) below. (Before setup runs, a bare "start collaboration" won't work: with no root entry file yet, the agent has no way to know `.handoff/` exists.)
 
-`setup` creates `.handoff-runtime/` (live state) and copies `PROJECT.md` /
-`CLAUDE.md` / `AGENTS.md` to your project root if they're absent. From then on
-Claude Code (via `CLAUDE.md`) and Codex (via `AGENTS.md`) both read the same
-`.handoff/`. Update later with `git -C .handoff pull`.
+`setup` creates `.handoff-runtime/` (live state) and copies `PROJECT.md` / `CLAUDE.md` / `AGENTS.md` to your project root if they're absent. From then on Claude Code (via `CLAUDE.md`) and Codex (via `AGENTS.md`) both read the same `.handoff/`. Update later with `git -C .handoff pull`.
 
-> **Git note.** `.handoff/` is itself a git clone. Always add **`.handoff-runtime/`**
-> to your project's `.gitignore`. For `.handoff/` itself, either keep it as an
-> updatable dependency (add `.handoff/` to `.gitignore`, `git -C .handoff pull` to
-> update) or vendor it into your repo (`rm -rf .handoff/.git`, then commit the files).
+> **Git note.** `.handoff/` is itself a git clone. Always add **`.handoff-runtime/`** to your project's `.gitignore`. For `.handoff/` itself, either keep it as an updatable dependency (add `.handoff/` to `.gitignore`, `git -C .handoff pull` to update) or vendor it into your repo (`rm -rf .handoff/.git`, then commit the files).
 
 ## Layout
 
@@ -55,6 +35,8 @@ your-project/
 │   ├── tools/archive.py            # consumed-stream archive helper
 │   ├── tools/doctor.py             # read-only runtime diagnostics
 │   ├── tools/poll-gate.py          # deterministic wake/idle pre-gate (no model call)
+│   ├── tools/_common.py            # shared protocol primitives (imported by the above)
+│   ├── tools/tests/                # unit tests for the tools
 │   ├── project-files/              # PROJECT.md / CLAUDE.md / AGENTS.md templates
 │   └── prompts/                    # cron-prompt.md (Claude) / codex-heartbeat-prompt.md (Codex)
 ├── .handoff-runtime/               # message streams, per-session cursors, claims, notes (gitignore)
@@ -91,7 +73,7 @@ See [`PROTOCOL.md`](PROTOCOL.md) for the full specification.
 
 |                | Claude side                               | Codex side                                                |
 | -------------- | ----------------------------------------- | --------------------------------------------------------- |
-| Entry file     | `CLAUDE.md`                               | `AGENTS.md`                                                |
+| Entry file     | `CLAUDE.md`                               | `AGENTS.md`                                               |
 | Wake mechanism | recurring cron (`prompts/cron-prompt.md`) | Codex App heartbeat (`prompts/codex-heartbeat-prompt.md`) |
 | Writes to      | `claude-to-codex.jsonl`                   | `codex-to-claude.jsonl`                                   |
 
@@ -112,16 +94,23 @@ The helper assigns ids under a lock, stamps every required field, and serializes
 
 ## Runtime diagnostics
 
-When a collaboration appears stuck or noisy, run the read-only doctor from the
-project root:
+When a collaboration appears stuck or noisy, run the read-only doctor from the project root:
 
 ```bash
 python .handoff/tools/doctor.py
 ```
 
-It checks stream JSON, local seq files, session cursors, legacy cursor anchors,
-claims, and unexpected runtime files. It does not modify project or runtime
-state.
+It checks stream JSON, local seq files, session cursors, legacy cursor anchors, claims, and unexpected runtime files. It also flags two cursor files for the same session holding different values, since only one of them is read. It does not modify project or runtime state.
+
+## Development
+
+The tools are stdlib-only Python and share `tools/_common.py`, so protocol invariants — stream names, id and session-id grammar, cursor resolution, the send lock, and durable writes — have exactly one implementation. Two tools resolving the same invariant separately is what previously let the wake gate and the doctor disagree about a cursor.
+
+```bash
+python -m unittest discover -s tools/tests -t tools/tests -v
+```
+
+CI runs the suite on Linux, macOS, and Windows.
 
 ## License
 

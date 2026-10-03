@@ -33,26 +33,27 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import re
 import sys
-import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# inbound stream for each side: (filename, writer_side)
-INBOUND = {
-    "claude": ("codex-to-claude.jsonl", "codex"),
-    "codex": ("claude-to-codex.jsonl", "claude"),
-}
+from _common import (  # noqa: E402  (import follows the path bootstrap above)
+    HandoffError,
+    INBOUND,
+    atomic_write_text,
+    find_project_root,
+    iter_jsonl_lines,
+    now_iso,
+    parse_msg_seq,
+    resolve_cursor,
+    resolve_session_id,
+)
 
+# PROTOCOL.md 4: lease-bearing vs pure-consumption types.
 LEASE_TYPES = {"task", "handoff", "question", "cancel", "error"}
 PURE_TYPES = {"status", "done"}
-
-ID_RE = re.compile(r"^(codex|claude)-(\d+)$")
-SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 
 EXIT_PROCESS = 0
 EXIT_PROACTIVE = 10
@@ -60,105 +61,30 @@ EXIT_IDLE = 20
 EXIT_ERROR = 2
 
 
-def find_project_root(start: Path) -> Path:
-    current = start.resolve()
-    for path in [current, *current.parents]:
-        if (path / ".handoff-runtime").is_dir():
-            return path
-        if path.name == ".handoff" and (path.parent / ".handoff-runtime").is_dir():
-            return path.parent
-        if (path / ".handoff").is_dir() and (path / ".handoff" / "PROTOCOL.md").is_file():
-            return path
-    return current.parent if current.name == ".handoff" else current
-
-
-def read_int(path: Path) -> int | None:
-    try:
-        return int(path.read_text(encoding="utf-8-sig").strip() or "0")
-    except (OSError, ValueError):
-        return None
-
-
-def parse_seq(value: Any) -> int | None:
-    if not isinstance(value, str):
-        return None
-    match = ID_RE.match(value)
-    return int(match.group(2)) if match else None
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-
-
-def atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
-
-
-def resolve_session_id(side: str, explicit: str | None, runtime: Path) -> str:
-    candidates = [
-        explicit,
-        os.environ.get("HANDOFF_SESSION_ID"),
-        os.environ.get(f"{side.upper()}_SESSION_ID"),
-    ]
-    session_file = runtime / f".{side}-session"
-    if session_file.exists():
-        try:
-            candidates.append(session_file.read_text(encoding="utf-8").strip())
-        except OSError:
-            pass
-    candidates.append(f"{side}-default")
-    for candidate in candidates:
-        if candidate and SESSION_RE.match(candidate):
-            return candidate
-    return f"{side}-default"
-
-
-def resolve_cursor(runtime: Path, side: str, session: str) -> int:
-    per_session = runtime / "cursors" / f"{side}-{session}"
-    value = read_int(per_session)
-    if value is not None:
-        return value
-    legacy = read_int(runtime / f".{side}-cursor")  # seed from legacy shared anchor
-    return legacy if legacy is not None else 0
-
-
 def read_inbound(runtime: Path, side: str) -> tuple[int, list[dict[str, Any]]]:
-    filename, _writer = INBOUND[side]
-    path = runtime / filename
-    if not path.is_file():
-        return 0, []
+    """Parse the inbound stream, dropping lines with no usable id."""
+    path = runtime / INBOUND[side][0]
     max_seq = 0
     messages: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(msg, dict):
-                continue
-            seq = parse_seq(msg.get("id"))
-            if seq is None:
-                continue
-            max_seq = max(max_seq, seq)
-            messages.append(msg)
+    for _line_no, line in iter_jsonl_lines(path):
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(msg, dict):
+            continue
+        seq = parse_msg_seq(msg.get("id"))
+        if seq is None:
+            continue
+        max_seq = max(max_seq, seq)
+        messages.append(msg)
     return max_seq, messages
 
 
-def classify(messages: list[dict[str, Any]], cursor: int, session: str) -> dict[str, int]:
+def classify(
+    messages: list[dict[str, Any]], cursor: int, session: str
+) -> dict[str, int]:
+    """Bucket the unread range (seq > cursor) by who it is for and what kind."""
     counts = {
         "unread_total": 0,
         "for_me_lease": 0,
@@ -167,7 +93,7 @@ def classify(messages: list[dict[str, Any]], cursor: int, session: str) -> dict[
         "unknown_type": 0,
     }
     for msg in messages:
-        seq = parse_seq(msg.get("id"))
+        seq = parse_msg_seq(msg.get("id"))
         if seq is None or seq <= cursor:
             continue
         counts["unread_total"] += 1
@@ -197,7 +123,10 @@ def load_proactive_streak(runtime: Path, side: str, session: str) -> int:
         return 0
     if not isinstance(data, dict):
         return 0
-    entry = data.get("sessions", {}).get(session)
+    sessions = data.get("sessions")
+    if not isinstance(sessions, dict):
+        return 0
+    entry = sessions.get(session)
     if isinstance(entry, dict) and isinstance(entry.get("idle_streak"), int):
         return max(0, entry["idle_streak"])
     return 0
@@ -225,8 +154,20 @@ def save_proactive_streak(
     atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
-def decide(counts: dict[str, int], runtime: Path, side: str, session: str,
-           proactive_every: int) -> tuple[str, int]:
+def decide(
+    counts: dict[str, int],
+    runtime: Path,
+    side: str,
+    session: str,
+    proactive_every: int,
+) -> tuple[str, int]:
+    """Pick process / proactive / idle.
+
+    An `unknown_type` message is treated as work rather than ignored: a type
+    this gate does not know about may still be a real request, and skipping it
+    would drop it silently. It is surfaced separately in the summary so the
+    model can see why it was woken.
+    """
     for_me = counts["for_me_lease"] + counts["for_me_pure"] + counts["unknown_type"]
     if for_me > 0:
         if proactive_every > 0:
@@ -244,14 +185,19 @@ def decide(counts: dict[str, int], runtime: Path, side: str, session: str,
     return "idle", EXIT_IDLE
 
 
-def main(argv: list[str]) -> int:
+def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Deterministic wake/idle gate for a handoff polling pass.",
         epilog="exit codes: 0 process, 10 proactive, 20 idle, 2 error",
     )
     parser.add_argument("--side", required=True, choices=sorted(INBOUND))
-    parser.add_argument("--session", help="Session id; defaults like send.py (env / .<side>-session / <side>-default).")
-    parser.add_argument("--root", type=Path, help="Project root; defaults to auto-detected.")
+    parser.add_argument(
+        "--session",
+        help="Session id; defaults like send.py (env / .<side>-session / <side>-default).",
+    )
+    parser.add_argument(
+        "--root", type=Path, help="Project root; defaults to auto-detected."
+    )
     parser.add_argument(
         "--proactive-every",
         type=int,
@@ -259,41 +205,66 @@ def main(argv: list[str]) -> int:
         metavar="N",
         help="Signal one proactive-review tick after N consecutive idle ticks (0 = disabled, read-only).",
     )
-    parser.add_argument("--quiet", action="store_true", help="Suppress the JSON summary; rely on exit code only.")
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress the JSON summary; rely on exit code only.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
+    def emit(summary: dict[str, Any]) -> None:
+        if not args.quiet:
+            print(json.dumps(summary, ensure_ascii=False))
+
     root = args.root.resolve() if args.root else find_project_root(Path.cwd())
     runtime = root / ".handoff-runtime"
     if not runtime.is_dir():
-        if not args.quiet:
-            print(json.dumps({"decision": "error", "reason": "no .handoff-runtime"}, ensure_ascii=False))
+        emit({"decision": "error", "reason": "no .handoff-runtime"})
         return EXIT_ERROR
 
-    session = resolve_session_id(args.side, args.session, runtime)
+    try:
+        # Same resolver as send.py and doctor.py, so the gate can never gate on
+        # a different cursor than the one the session actually maintains.
+        session = resolve_session_id(args.side, args.session, runtime)
+    except HandoffError as exc:
+        emit({"decision": "error", "side": args.side, "reason": str(exc)})
+        return EXIT_ERROR
+
     cursor = resolve_cursor(runtime, args.side, session)
     stream_max, messages = read_inbound(runtime, args.side)
-    counts = classify(messages, cursor, session)
+    counts = classify(messages, cursor.value, session)
     decision, code = decide(counts, runtime, args.side, session, args.proactive_every)
 
-    if not args.quiet:
-        summary = {
-            "side": args.side,
-            "session": session,
-            "cursor": cursor,
-            "stream_max_seq": stream_max,
-            "decision": decision,
-            "unread_total": counts["unread_total"],
-            "for_me": counts["for_me_lease"] + counts["for_me_pure"] + counts["unknown_type"],
-            "for_me_lease": counts["for_me_lease"],
-            "for_me_pure": counts["for_me_pure"],
-            "directed_elsewhere": counts["directed_elsewhere"],
-        }
-        print(json.dumps(summary, ensure_ascii=False))
+    for_me = counts["for_me_lease"] + counts["for_me_pure"] + counts["unknown_type"]
+    summary = {
+        "side": args.side,
+        "session": session,
+        "cursor": cursor.value,
+        "cursor_source": cursor.source,
+        "cursor_file": cursor.used_filename or cursor.filename,
+        "stream_max_seq": stream_max,
+        "decision": decision,
+        "unread_total": counts["unread_total"],
+        "for_me": for_me,
+        "for_me_lease": counts["for_me_lease"],
+        "for_me_pure": counts["for_me_pure"],
+        "directed_elsewhere": counts["directed_elsewhere"],
+        "unknown_type": counts["unknown_type"],
+    }
+    emit(summary)
     return code
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except HandoffError as exc:
+        print(f"FATAL: {exc}", file=sys.stderr)
+        raise SystemExit(EXIT_ERROR)

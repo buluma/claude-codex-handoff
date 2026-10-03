@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tools:
+    # The kit ships platform-specific setup scripts and a cross-platform
+    # stdlib-only toolchain, so test on all three.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # Oldest and newest supported interpreters.
+          python-version: ${{ matrix.os == 'windows-latest' && '3.9' || '3.12' }}
+      - name: Run tool tests
+        run: python -m unittest discover -s tools/tests -t tools/tests -v
+
+  setup-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck setup.sh
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck setup.sh
+      - name: Verify setup.sh creates a v1.9 runtime layout
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d)"
+          mkdir -p "$workdir/.handoff"
+          cp setup.sh "$workdir/.handoff/"
+          cd "$workdir"
+          bash .handoff/setup.sh
+          for d in notes claims locks cursors archive; do
+            test -d ".handoff-runtime/$d" || { echo "missing $d"; exit 1; }
+          done
+          for f in claude-to-codex.jsonl codex-to-claude.jsonl; do
+            test -f ".handoff-runtime/$f" || { echo "missing $f"; exit 1; }
+          done
+          for f in .claude-seq .codex-seq .claude-cursor .codex-cursor; do
+            test -f ".handoff-runtime/$f" || { echo "missing $f"; exit 1; }
+          done
+          for f in PROJECT.md CLAUDE.md AGENTS.md; do
+            test -f "$f" || { echo "missing $f"; exit 1; }
+          done

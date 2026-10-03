@@ -6,7 +6,7 @@
 
 1. Read `PROJECT.md`.
 2. Read `.handoff/PROTOCOL.md`.
-3. Confirm `.handoff-runtime/` is initialized. This session's consumption cursor is `.handoff-runtime/cursors/claude-<MY_SESSION>` (if it is missing, seed it from the legacy `.claude-cursor`, default `0`). `.claude-seq` starts at `0`.
+3. Confirm `.handoff-runtime/` is initialized. This session's consumption cursor is `.handoff-runtime/cursors/claude-<MY_SESSION>` (drop the `claude-` prefix when `<MY_SESSION>` already starts with it; §6.1) (if it is missing, seed it from the legacy `.claude-cursor`, default `0`). `.claude-seq` starts at `0`.
 4. Before processing tasks each round, read `.handoff-runtime/codex-to-claude.jsonl` and consume unread messages under the protocol.
 
 If `PROJECT.md` still contains `<FILL_IN>` markers, the project is not initialized. Ask the user for the project name, a one-line description, key conventions, the current focus, and preferences for tasks to hand to Codex. Write that back to `PROJECT.md`, then continue the collaboration flow.
@@ -37,7 +37,7 @@ This project uses Claude ↔ Codex asynchronous collaboration. The protocol is `
 - If an inbound message has `to_session` and it is not the current `MY_SESSION`, it is a direct message for another Claude session. Skip it and advance this session's cursor. Do not take a claim. Do not stop the round. The target session has its own cursor and will not miss it.
 - Do not start a persistent Monitor. Create a recurring cron every 10 minutes from `.handoff/prompts/cron-prompt.md`.
 - Prefer `.handoff/tools/send.py` when sending:
-  - `python .handoff/tools/send.py --side claude --type task --summary "..."`
+- `python .handoff/tools/send.py --side claude --type task --summary "..."`
 - Before sending, the helper should take `max(.handoff-runtime/.claude-seq, c2x max seq)+1`, then persist it after the send.
 - Write long content to `.handoff-runtime/notes/<msg-id>.md` and reference it in `refs.notes_file`.
 - Hand-written JSONL is only a fallback when the helper is unavailable.

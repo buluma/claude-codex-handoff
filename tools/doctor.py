@@ -22,14 +22,19 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-STREAMS = {
-    "c2x": ("claude-to-codex.jsonl", "claude", "codex"),
-    "x2c": ("codex-to-claude.jsonl", "codex", "claude"),
-}
+from _common import (  # noqa: E402  (import follows the path bootstrap above)
+    ID_RE,
+    STREAMS,
+    cursor_path_candidates,
+    find_project_root,
+    iter_jsonl_lines,
+    read_int,
+    resolve_cursor,
+    side_cursor_files,
+)
 
-ID_RE = re.compile(r"^(codex|claude)-(\d+)$")
-SESSION_CURSOR_RE = re.compile(r"^(codex|claude)-[A-Za-z0-9_.:-]{1,64}$")
 
 KNOWN_DIRS = {"archive", "claims", "cursors", "locks", "notes"}
 KNOWN_FILES = {
@@ -47,6 +52,11 @@ KNOWN_FILES = {
     ".codex-pollgate.json",
     "codex-heartbeat-state.json",
 }
+
+# PROTOCOL.md 6.1: a cursor file is `cursors/<side>-<session>`. A session id
+# may itself already carry the `<side>-` prefix, so accept either spelling
+# rather than only the doubled one -- see _common.cursor_filename.
+CURSOR_NAME_RE = re.compile(r"^(codex|claude)-[A-Za-z0-9_.:-]{1,64}$")
 
 
 @dataclass
@@ -78,34 +88,6 @@ class Report:
             f"SUMMARY: {self.count('ERROR')} error(s), "
             f"{self.count('WARN')} warning(s), {self.count('INFO')} info"
         )
-
-
-def find_project_root(cwd: Path) -> Path:
-    candidates = [cwd, *cwd.parents]
-    for path in candidates:
-        if (path / ".handoff-runtime").is_dir():
-            return path
-        if path.name == ".handoff" and (path.parent / ".handoff-runtime").is_dir():
-            return path.parent
-        if (path / ".handoff").is_dir() and (path / ".handoff" / "PROTOCOL.md").is_file():
-            return path
-    return cwd.parent if cwd.name == ".handoff" else cwd
-
-
-def read_int(path: Path) -> int | None:
-    try:
-        return int(path.read_text(encoding="utf-8-sig").strip() or "0")
-    except (OSError, ValueError):
-        return None
-
-
-def parse_id(value: Any) -> tuple[str, int] | None:
-    if not isinstance(value, str):
-        return None
-    match = ID_RE.match(value)
-    if not match:
-        return None
-    return match.group(1), int(match.group(2))
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -143,7 +125,9 @@ def validate_notes_file(runtime: Path, msg_id: str, value: Any, report: Report) 
         report.warn(f"{msg_id}: refs.notes_file is missing: {value}")
 
 
-def read_stream(runtime: Path, key: str, report: Report) -> tuple[int, dict[str, dict[str, Any]]]:
+def read_stream(
+    runtime: Path, key: str, report: Report
+) -> tuple[int, dict[str, dict[str, Any]]]:
     filename, writer_side, _reader_side = STREAMS[key]
     path = runtime / filename
     if not path.is_file():
@@ -154,19 +138,13 @@ def read_stream(runtime: Path, key: str, report: Report) -> tuple[int, dict[str,
     last_seq = 0
     seen_ids: set[str] = set()
     messages: dict[str, dict[str, Any]] = {}
+    unparseable = 0
 
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        report.error(f"{filename}: cannot read stream: {exc}")
-        return 0, {}
-
-    for line_no, line in enumerate(lines, 1):
-        if not line.strip():
-            continue
+    for line_no, line in iter_jsonl_lines(path):
         try:
             msg = json.loads(line)
         except json.JSONDecodeError as exc:
+            unparseable += 1
             report.error(f"{filename}:{line_no}: invalid JSON: {exc.msg}")
             continue
         if not isinstance(msg, dict):
@@ -174,15 +152,19 @@ def read_stream(runtime: Path, key: str, report: Report) -> tuple[int, dict[str,
             continue
 
         msg_id = msg.get("id")
-        parsed = parse_id(msg_id)
-        if parsed is None:
+        match = ID_RE.match(str(msg_id)) if isinstance(msg_id, str) else None
+        if match is None:
             report.error(f"{filename}:{line_no}: invalid id {msg_id!r}")
             continue
-        side, seq = parsed
+        side, seq = match.group(1), int(match.group(2))
         if side != writer_side:
-            report.error(f"{filename}:{line_no}: id side {side!r} does not match writer {writer_side!r}")
+            report.error(
+                f"{filename}:{line_no}: id side {side!r} does not match writer {writer_side!r}"
+            )
         if msg.get("from") != writer_side:
-            report.error(f"{filename}:{line_no}: from={msg.get('from')!r} does not match writer {writer_side!r}")
+            report.error(
+                f"{filename}:{line_no}: from={msg.get('from')!r} does not match writer {writer_side!r}"
+            )
         if seq < last_seq:
             report.warn(f"{filename}:{line_no}: seq decreased from {last_seq} to {seq}")
         last_seq = seq
@@ -199,6 +181,11 @@ def read_stream(runtime: Path, key: str, report: Report) -> tuple[int, dict[str,
             validate_notes_file(runtime, str(msg_id), refs.get("notes_file"), report)
 
     report.info(f"{filename}: {len(seen_ids)} message(s), max seq {max_seq}")
+    if unparseable:
+        report.error(
+            f"{filename}: {unparseable} unparseable line(s); "
+            "archive.py and poll-gate.py will skip them"
+        )
     return max_seq, messages
 
 
@@ -211,7 +198,9 @@ def check_seq_files(runtime: Path, max_by_side: dict[str, int], report: Report) 
             continue
         expected = max_by_side.get(side, 0)
         if value < expected:
-            report.warn(f".{side}-seq={value} is behind stream max seq {expected}; send.py can recover")
+            report.warn(
+                f".{side}-seq={value} is behind stream max seq {expected}; send.py can recover"
+            )
         elif value > expected:
             report.info(f".{side}-seq={value} is ahead of stream max seq {expected}")
 
@@ -226,7 +215,7 @@ def check_cursors(runtime: Path, max_by_reader: dict[str, int], report: Report) 
     for path in sorted(cursors_dir.iterdir()):
         if not path.is_file():
             continue
-        if not SESSION_CURSOR_RE.match(path.name):
+        if not CURSOR_NAME_RE.match(path.name):
             report.warn(f"cursors/{path.name}: unexpected cursor filename")
             continue
         side = path.name.split("-", 1)[0]
@@ -237,9 +226,13 @@ def check_cursors(runtime: Path, max_by_reader: dict[str, int], report: Report) 
             continue
         peer_max = max_by_reader.get(side, 0)
         if value > peer_max:
-            report.warn(f"cursors/{path.name}={value} is ahead of peer stream max seq {peer_max}")
+            report.warn(
+                f"cursors/{path.name}={value} is ahead of peer stream max seq {peer_max}"
+            )
         elif value < peer_max:
-            report.info(f"cursors/{path.name}: {peer_max - value} unread peer message(s)")
+            report.info(
+                f"cursors/{path.name}: {peer_max - value} unread peer message(s)"
+            )
 
     for side, count in seen.items():
         if count == 0:
@@ -249,14 +242,52 @@ def check_cursors(runtime: Path, max_by_reader: dict[str, int], report: Report) 
         path = runtime / f".{side}-cursor"
         value = read_int(path)
         if value is None:
-            report.warn(f".{side}-cursor: missing or invalid legacy cursor")
+            report.info(f".{side}-cursor: absent (legacy anchor is optional)")
             continue
         peer_max = max_by_reader.get(side, 0)
         if value > peer_max:
-            report.warn(f".{side}-cursor={value} is ahead of peer stream max seq {peer_max}")
+            report.warn(
+                f".{side}-cursor={value} is ahead of peer stream max seq {peer_max}"
+            )
 
 
-def check_claims(runtime: Path, all_messages: dict[str, dict[str, Any]], report: Report) -> None:
+def check_cursor_resolution(runtime: Path, report: Report) -> None:
+    """Flag cursors that disagree with each other, where one is ignored.
+
+    A session's cursor may exist under either spelling (see
+    _common.cursor_filename). When both exist and hold different values, only
+    the first is read, so the other session's progress is silently discarded.
+    This was worse before the tools shared one resolver: doctor.py read
+    `cursors/claude-main` while poll-gate.py looked for
+    `cursors/claude-claude-main`, so the gate reported "idle" with real work
+    queued and the model was never woken.
+    """
+    for side in ("claude", "codex"):
+        files = {path.name: path for path in side_cursor_files(runtime, side)}
+        for session in sorted({name[len(side) + 1 :] for name in files}):
+            if not session:
+                continue
+            candidates = [
+                name for name in cursor_path_candidates(side, session) if name in files
+            ]
+            if len(candidates) < 2:
+                continue
+            values = {name: read_int(files[name]) for name in candidates}
+            if len(set(values.values())) > 1:
+                winner = resolve_cursor(runtime, side, session)
+                detail = ", ".join(
+                    f"{name}={value}" for name, value in sorted(values.items())
+                )
+                report.warn(
+                    f"cursors/: {side} session {session!r} has conflicting cursors "
+                    f"({detail}); poll-gate.py reads cursors/{winner.used_filename}, "
+                    "so the other is ignored. Keep only one."
+                )
+
+
+def check_claims(
+    runtime: Path, all_messages: dict[str, dict[str, Any]], report: Report
+) -> None:
     claims_dir = runtime / "claims"
     if not claims_dir.is_dir():
         report.warn("claims/: missing")
@@ -278,7 +309,9 @@ def check_claims(runtime: Path, all_messages: dict[str, dict[str, Any]], report:
         if not isinstance(message_id, str):
             report.error(f"claims/{path.name}: message_id missing or invalid")
         elif message_id not in all_messages:
-            report.warn(f"claims/{path.name}: message_id {message_id} not found in live streams")
+            report.warn(
+                f"claims/{path.name}: message_id {message_id} not found in live streams"
+            )
         expires_at = parse_time(claim.get("expires_at"))
         if expires_at is None:
             report.warn(f"claims/{path.name}: expires_at missing or invalid")
@@ -295,7 +328,9 @@ def check_runtime_top_level(runtime: Path, report: Report) -> None:
             continue
         if path.name in KNOWN_FILES:
             continue
-        report.warn(f"{path.name}: unexpected top-level runtime file; likely stale temp/scratch")
+        report.warn(
+            f"{path.name}: unexpected top-level runtime file; likely stale temp/scratch"
+        )
 
 
 def run(root: Path, strict: bool) -> int:
@@ -319,6 +354,7 @@ def run(root: Path, strict: bool) -> int:
 
     check_seq_files(runtime, max_by_side, report)
     check_cursors(runtime, max_by_reader, report)
+    check_cursor_resolution(runtime, report)
     check_claims(runtime, all_messages, report)
 
     report.print()
@@ -330,12 +366,20 @@ def run(root: Path, strict: bool) -> int:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Read-only diagnostics for .handoff-runtime.")
-    parser.add_argument("--root", type=Path, help="Project root; defaults to auto-detected current project.")
-    parser.add_argument("--strict", action="store_true", help="Return non-zero when warnings are found.")
+    parser = argparse.ArgumentParser(
+        description="Read-only diagnostics for .handoff-runtime."
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        help="Project root; defaults to auto-detected current project.",
+    )
+    parser.add_argument(
+        "--strict", action="store_true", help="Return non-zero when warnings are found."
+    )
     args = parser.parse_args(argv)
 
-    root = args.root.resolve() if args.root else find_project_root(Path.cwd().resolve())
+    root = args.root.resolve() if args.root else find_project_root(Path.cwd())
     return run(root, strict=args.strict)
 
 

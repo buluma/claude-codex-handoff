@@ -1,8 +1,8 @@
-# Codex ↔ Claude collaboration protocol v1.12
+# Codex ↔ Claude collaboration protocol v1.13
 
 This protocol defines how two AI sessions (Codex and Claude) collaborate asynchronously through the project filesystem. `.handoff/` is the copyable protocol and tools directory. `.handoff-runtime/` is the project runtime directory. The two must stay separate.
 
-This file is the current protocol. The full changelog is in `VERSION.md`. The message format field `v` is fixed at `"1.0"`. A documentation version bump does not change the message field version. v1.12 builds on v1.11 by distinguishing the idle-backoff carrier: a Codex App heartbeat may back off in 10-minute steps, while a Claude recurring cron uses an expressible 10→20→30→60 minute ladder capped at 60 minutes. Discovering, consuming, claiming, or resuming a new peer message still returns the interval directly to 10 minutes. v1.11 defines adaptive cadence: once a side discovers, consumes, claims, or resumes a new peer message, the next loop interval returns directly to 10 minutes. v1.10 builds on v1.9 with a backward-compatible deterministic pre-gate (`tools/poll-gate.py`, which decides each round's wake/idle in code rather than in the model, with optional `--proactive-every` cadence). v1.9 builds on v1.8 with per-session cursors (removing same-side multi-session head-of-line blocking), replay idempotency, lease renewal, stream archival, a trust boundary, optional liveness, and adaptive cadence. Old runtimes keep working with no migration.
+This file is the current protocol. The full changelog is in `VERSION.md`. The message format field `v` is fixed at `"1.0"`. A documentation version bump does not change the message field version. v1.13 is a toolchain consolidation with no wire-format change: the four tools now share one implementation of the protocol invariants (`tools/_common.py`), and a cursor-resolution disagreement is fixed in which `poll-gate.py` and `doctor.py` read different files, so the wake gate could report `idle` while unread work sat in the queue (§6.1). v1.12 builds on v1.11 by distinguishing the idle-backoff carrier: a Codex App heartbeat may back off in 10-minute steps, while a Claude recurring cron uses an expressible 10→20→30→60 minute ladder capped at 60 minutes. Discovering, consuming, claiming, or resuming a new peer message still returns the interval directly to 10 minutes. v1.11 defines adaptive cadence: once a side discovers, consumes, claims, or resumes a new peer message, the next loop interval returns directly to 10 minutes. v1.10 builds on v1.9 with a backward-compatible deterministic pre-gate (`tools/poll-gate.py`, which decides each round's wake/idle in code rather than in the model, with optional `--proactive-every` cadence). v1.9 builds on v1.8 with per-session cursors (removing same-side multi-session head-of-line blocking), replay idempotency, lease renewal, stream archival, a trust boundary, optional liveness, and adaptive cadence. Old runtimes keep working with no migration.
 
 ---
 
@@ -12,7 +12,7 @@ When implementing or executing this protocol, follow these short rules first. Th
 
 1. `.handoff/` holds only the protocol, prompts, and helpers. `.handoff-runtime/` holds only runtime state.
 2. Prefer `.handoff/tools/send.py` when sending. Do not hand-write JSONL while the helper is available.
-3. Consumption is decided by `.handoff-runtime/cursors/<side>-<MY_SESSION>`. The legacy `.<side>-cursor` file is only a compatibility anchor.
+3. Consumption is decided by `.handoff-runtime/cursors/<side>-<MY_SESSION>`. The legacy `.<side>-cursor` file is only a compatibility anchor. The `<side>-` prefix is not repeated when the session id already carries it; see §6.1.
 4. Process inbound messages in ascending `seq` order. If you can keep going, continue until the queue is empty.
 5. When `to_session` points at another session, skip the message and advance the current session cursor. Do not claim. Do not stop.
 6. `status` and every `done` are pure consumption. Do not ack `done`. If you disagree, send a new `handoff` / `question`.
@@ -69,6 +69,7 @@ Conventions:
 - `.handoff/` holds only the protocol, prompts, and helpers, and can be copied as a whole into another project.
 - `.handoff-runtime/` holds only message streams, cursors, seq files, notes, claims, archive, scratch, or monitor state. It should not be committed into a project template.
 - If you find message streams, cursors, notes, or claims still under `.handoff/`, reinitialize or migrate them to `.handoff-runtime/` first.
+- A cursor file is spelled `cursors/<session>` when the session id already begins with the side prefix (`claude-main`), and `cursors/<side>-<session>` when it does not. Readers accept both spellings so a runtime written either way keeps its progress; `doctor.py` reports a conflict when both exist with different values. §6.1 is normative.
 
 ---
 
@@ -117,37 +118,37 @@ Minimal message:
 
 Required fields:
 
-| Field | Rule |
-| --- | --- |
-| `v` | Fixed `"1.0"` |
-| `id` | `codex-000001` or `claude-000001` form, monotonically increasing on this side |
-| `ts` | UTC ISO8601, ending in `Z` |
-| `from` | `"codex"` or `"claude"` |
-| `type` | See section 4 |
-| `thread` | Id of the first message in the thread. A new thread equals this message's id |
-| `summary` | Single-line plain text, at most 200 characters. Do not write markdown or newlines |
-| `blocking` | Boolean |
-| `refs` | At least the three keys `reply_to`, `notes_file`, and `commit` |
+| Field      | Rule                                                                              |
+| ---------- | --------------------------------------------------------------------------------- |
+| `v`        | Fixed `"1.0"`                                                                     |
+| `id`       | `codex-000001` or `claude-000001` form, monotonically increasing on this side     |
+| `ts`       | UTC ISO8601, ending in `Z`                                                        |
+| `from`     | `"codex"` or `"claude"`                                                           |
+| `type`     | See section 4                                                                     |
+| `thread`   | Id of the first message in the thread. A new thread equals this message's id      |
+| `summary`  | Single-line plain text, at most 200 characters. Do not write markdown or newlines |
+| `blocking` | Boolean                                                                           |
+| `refs`     | At least the three keys `reply_to`, `notes_file`, and `commit`                    |
 
 Common optional fields:
 
-| Field | Purpose |
-| --- | --- |
-| `context` | Short context. Long context belongs in notes |
-| `next_action` | What the peer should do next. Required on `handoff` |
-| `goal` | Goal of a `task`. A `task` needs `goal` or `next_action` |
-| `acceptance` | Array of acceptance conditions |
-| `constraints` | Array of constraints |
-| `context_files` | Array of files the peer should read |
-| `files_changed` | Array of files changed this round |
-| `priority` | `"urgent"`, `"normal"`, `"backlog"` |
-| `expected_within` | ISO8601 duration, such as `"PT2H"` |
-| `state` | Only for `status` / `done`: `claimed`, `progress`, `blocked`, `awaiting-input`, `shutdown` |
-| `eta` | ISO8601 duration, used for `claimed` / `progress` |
-| `applied` / `skipped` / `total_proposed` | Only for `done`. Records an audit of which suggestions were adopted |
-| `peer_cursor_observed` | Max seq of the peer stream observed at send time. The field name keeps its historical name. The actual meaning is peer stream max seq observed |
-| `from_session` | Sender's current session id. The helper writes it by default |
-| `to_session` | Optional target session id. On a direct reply, the helper infers it from `from_session` of `refs.reply_to` |
+| Field                                    | Purpose                                                                                                                                        |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `context`                                | Short context. Long context belongs in notes                                                                                                   |
+| `next_action`                            | What the peer should do next. Required on `handoff`                                                                                            |
+| `goal`                                   | Goal of a `task`. A `task` needs `goal` or `next_action`                                                                                       |
+| `acceptance`                             | Array of acceptance conditions                                                                                                                 |
+| `constraints`                            | Array of constraints                                                                                                                           |
+| `context_files`                          | Array of files the peer should read                                                                                                            |
+| `files_changed`                          | Array of files changed this round                                                                                                              |
+| `priority`                               | `"urgent"`, `"normal"`, `"backlog"`                                                                                                            |
+| `expected_within`                        | ISO8601 duration, such as `"PT2H"`                                                                                                             |
+| `state`                                  | Only for `status` / `done`: `claimed`, `progress`, `blocked`, `awaiting-input`, `shutdown`                                                     |
+| `eta`                                    | ISO8601 duration, used for `claimed` / `progress`                                                                                              |
+| `applied` / `skipped` / `total_proposed` | Only for `done`. Records an audit of which suggestions were adopted                                                                            |
+| `peer_cursor_observed`                   | Max seq of the peer stream observed at send time. The field name keeps its historical name. The actual meaning is peer stream max seq observed |
+| `from_session`                           | Sender's current session id. The helper writes it by default                                                                                   |
+| `to_session`                             | Optional target session id. On a direct reply, the helper infers it from `from_session` of `refs.reply_to`                                     |
 
 `refs.notes_file` may point only at a relative path under `.handoff-runtime/notes/`, for example `notes/claude-000001.md`. Absolute paths, `..`, empty path segments, backslashes, and drive letters are forbidden.
 
@@ -168,15 +169,15 @@ Common optional fields:
 
 ## 4. Message types
 
-| type | Meaning | Receiver action |
-| --- | --- | --- |
-| `task` | Assign new work | Needs a lease. Reply `done` when finished, or `question` when clarification is needed |
-| `handoff` | A is done; ask the peer to do B | Needs a lease. Reply `done` when finished, or `question` when clarification is needed |
-| `question` | Needs a decision or clarification | Needs a lease. Reply `done` after answering, or derive a new `task` / `handoff` |
-| `done` | Finished or confirmed | Pure-consumption terminal state. The receiver advances its own cursor and does not ack. If it disagrees, it sends a new `handoff` / `question` |
-| `status` | Progress, heartbeat, blocked, awaiting-input, or a shutdown request | Pure consumption, unless it carries a clear follow-up action |
-| `error` | Processing failed, or a fatal schema error | Needs a lease. Receive it and handle the problem |
-| `cancel` | Cancel a task/handoff | Needs a lease. If work has started, stop as soon as possible and reply `done` |
+| type       | Meaning                                                             | Receiver action                                                                                                                                |
+| ---------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `task`     | Assign new work                                                     | Needs a lease. Reply `done` when finished, or `question` when clarification is needed                                                          |
+| `handoff`  | A is done; ask the peer to do B                                     | Needs a lease. Reply `done` when finished, or `question` when clarification is needed                                                          |
+| `question` | Needs a decision or clarification                                   | Needs a lease. Reply `done` after answering, or derive a new `task` / `handoff`                                                                |
+| `done`     | Finished or confirmed                                               | Pure-consumption terminal state. The receiver advances its own cursor and does not ack. If it disagrees, it sends a new `handoff` / `question` |
+| `status`   | Progress, heartbeat, blocked, awaiting-input, or a shutdown request | Pure consumption, unless it carries a clear follow-up action                                                                                   |
+| `error`    | Processing failed, or a fatal schema error                          | Needs a lease. Receive it and handle the problem                                                                                               |
+| `cancel`   | Cancel a task/handoff                                               | Needs a lease. If work has started, stop as soon as possible and reply `done`                                                                  |
 
 Lease message types: `task`, `handoff`, `question`, `cancel`, `error`.
 
@@ -231,7 +232,8 @@ Every Claude cron fire, Codex heartbeat, or manual activation runs one polling p
 ### 6.1 Per-session cursor
 
 - Each session records its consumption progress in `.handoff-runtime/cursors/<side>-<session>`. The content is the max seq it has consumed on the peer stream.
-- If that file does not exist, seed it from the legacy shared `.<side>-cursor` value (or `0` if that file is absent), so history is not consumed twice. This keeps progress intact when upgrading from v1.8.
+- **The `<side>-` prefix is applied only when the session id does not already start with it.** Session ids per §3.1 conventionally do (`claude-main`, `codex-main`, `claude-default`), so their cursor file is `cursors/claude-main`, not `cursors/claude-claude-main`. Readers must accept both spellings so a runtime written either way keeps its progress, and `doctor.py` reports a conflict when both exist with different values. Every tool resolves the cursor through this one rule; never re-derive the filename.
+- If no file exists for this session, seed it from the legacy shared `.<side>-cursor` value (or `0` if that file is absent), so history is not consumed twice. This keeps progress intact when upgrading from v1.8.
 - The shared `.<side>-cursor` remains a compatibility anchor. After advancing its own cursor, a v1.9 reader may update it to the minimum of all same-side session cursors, for §13 archival and external tools. **Consumption is always decided by this session's per-session cursor.**
 - Advance the cursor with an atomic write (temp file + rename).
 
@@ -241,11 +243,11 @@ For each inbound message with `seq > my_cursor`, in ascending seq order:
 
 - **Addressed to another session** (`to_session` is present and ≠ the current `MY_SESSION`): it is not mine. **Skip it and advance my own cursor**, then continue to the next message. Do not stop. Do not claim. Because the cursor is per-session, the target session uses its own cursor and will not miss the message.
 - **Broadcast, or addressed to me** (no `to_session`, or `to_session == MY_SESSION`):
-  - Pure-consumption messages (`status` / every `done`): consume them and advance my cursor. Do not ack `done`.
-  - Lease messages (`task` / `handoff` / `question` / `cancel` / `error`): acquire a claim under §7 first:
-    - Claim acquired → check §12, finish the side effects (notes, outbound `done` / `question` / `error`), then advance my cursor.
-    - The claim is held by **another** session and has not expired → that message is being handled by the other session. **Advance my cursor past it** (do not stop).
-    - The claim belongs to the current `MY_SESSION` and has not expired → this is an in-flight message that can be resumed. Resume it under §6.3.
+- Pure-consumption messages (`status` / every `done`): consume them and advance my cursor. Do not ack `done`.
+- Lease messages (`task` / `handoff` / `question` / `cancel` / `error`): acquire a claim under §7 first:
+- Claim acquired → check §12, finish the side effects (notes, outbound `done` / `question` / `error`), then advance my cursor.
+- The claim is held by **another** session and has not expired → that message is being handled by the other session. **Advance my cursor past it** (do not stop).
+- The claim belongs to the current `MY_SESSION` and has not expired → this is an in-flight message that can be resumed. Resume it under §6.3.
 - After one message is finished and the cursor has advanced, continue to the next. Do not stop just because this round already handled one lease.
 
 ### 6.3 Replay idempotency (the other half of crash safety)
@@ -360,6 +362,7 @@ Codex side:
 Rules for both sides:
 
 - **Optional deterministic pre-gate**: each cron / heartbeat round may first run `.handoff/tools/poll-gate.py --side <side>`, which decides unread / idle deterministically, so the model does not have to judge "idle or process". Exit codes: `0` = unread messages for this session (process), `20` = pure idle (update cadence only, then exit quietly), `2` = runtime missing. It is read-only and stateless by default. With `--proactive-every N` it also keeps a per-session idle streak and, after N consecutive empty-queue rounds, returns `10` to trigger one §6.4 bounded proactive review. That state is written to `.handoff-runtime/.<side>-pollgate.json`. The gate only decides whether to invoke the model. It does not replace §6/§12 content handling or authorization checks.
+- The gate's JSON summary reports `cursor` and `cursor_file`, so a round can confirm which cursor it gated on. Unread messages that the gate did not count mean the cursor or the message addressing is wrong — run `doctor.py` before treating a stream as empty.
 - Only active / in-flight work needs a progress heartbeat. Pure idle does not need an outbound message.
 - **Optional liveness**: each round may atomically write `.handoff-runtime/.<side>-lastseen` to the current UTC timestamp (it does not enter the stream and does not count as a message). It is only a hint. A stale `lastseen` is a clue that the peer may have stalled, not proof of failure. Do not treat peer idle silence as failure.
 - When a new inbound message arrives, or the user explicitly mentions the peer's state, you must fresh-read the stream and the cursor.

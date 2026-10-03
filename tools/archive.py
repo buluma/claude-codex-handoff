@@ -136,8 +136,13 @@ def archive_stream(runtime: Path, key: str, dry_run: bool) -> str:
             )
 
         ts = _timestamp()
-        archive_path = runtime / "archive" / f"{filename}.{ts}.jsonl"
-        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        archive_dir = runtime / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = archive_dir / f"{filename}.{ts}.jsonl"
+        suffix = 1
+        while archive_path.exists():
+            archive_path = archive_dir / f"{filename}.{ts}.{suffix:03d}.jsonl"
+            suffix += 1
         atomic_write_text(archive_path, "\n".join(to_archive) + "\n")
         atomic_write_text(stream, ("\n".join(retained) + "\n") if retained else "")
         return (
@@ -147,7 +152,7 @@ def archive_stream(runtime: Path, key: str, dry_run: bool) -> str:
 
 
 def _timestamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
